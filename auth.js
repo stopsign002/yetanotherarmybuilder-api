@@ -1,6 +1,7 @@
 import argon2 from 'argon2';
 import { randomBytes } from 'node:crypto';
 import { query } from './db.js';
+import { notify } from './mail.js';
 import {
   COOKIE_NAME,
   cookieOpts,
@@ -60,6 +61,11 @@ export async function authRoutes(app) {
       [username, pwHash, recHash]
     );
     const user = rows[0];
+
+    notify(
+      `[yaab] Access request: ${user.username}`,
+      `New user "${user.username}" registered on yaab and is awaiting approval.\n\nApprove/revoke: https://yaab.thewheeliebois.com (Admin → Users)`
+    );
 
     // Approval gating: don't issue a session — admin must approve first.
     // The client (auth-modal.js) reads `pending: true` and shows a

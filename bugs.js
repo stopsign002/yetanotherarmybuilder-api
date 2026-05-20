@@ -1,4 +1,5 @@
 import { query } from './db.js';
+import { notify } from './mail.js';
 
 // Field caps from the docs/ADMIN_API.md spec.
 const TITLE_MAX = 200;
@@ -39,6 +40,11 @@ export async function bugsRoutes(app) {
          RETURNING id`,
       [u.username, title, description, diagnostics]
     );
-    return { id: Number(rows[0].id) };
+    const id = Number(rows[0].id);
+    notify(
+      `[yaab] Bug report #${id} from ${u.username}`,
+      `${u.username} filed a bug report on yaab.\n\nTitle: ${title}\n\n${description}\n\nManage: https://yaab.thewheeliebois.com (Admin → Bugs)`
+    );
+    return { id };
   });
 }
