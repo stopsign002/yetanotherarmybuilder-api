@@ -105,9 +105,13 @@ All routes require `req.user.is_admin === true` — `requireAdmin()` returns 401
 
 | Method | Path | Auth | Body | Success | Errors |
 |---|---|---|---|---|---|
-| POST | `/bugs` | session | `{ title, description, diagnostics? }` | `200 { id }` | `400` empty/oversized field, `401` |
+| POST | `/bugs` | session | `{ title, description, diagnostics?, email? }` | `200 { id }` | `400` empty/oversized/malformed field, `401` |
 
-Caps: `title` ≤ 200, `description` ≤ 4000, `diagnostics` ≤ 16_000 chars. `username` is stored as a snapshot string (not a FK to `users.username`), so reports survive revoke or future user-deletion.
+Caps: `title` ≤ 200, `description` ≤ 4000, `diagnostics` ≤ 16_000, `email` ≤ 254 chars. `username` is stored as a snapshot string (not a FK to `users.username`), so reports survive revoke or future user-deletion.
+
+`email` is optional and used for exactly one thing: telling the reporter their report was resolved. A malformed address is **rejected** rather than dropped — silently discarding it means the reporter waits for a note that never arrives. This route deliberately sends **no** mail on submission; `~/sites/base/bug-fixer.py` (hourly) mails either "fixed" or "needs a human" and is the only sender of reporter notifications, including for reports an admin fixes by hand via `/admin/bugs/:id/fix`.
+
+Columns the hourly fixer owns — the API only ever writes `email`: `fix_mode` (`'auto'` → verified and applied unattended, `'intervention'` → a human finished it), `fix_report` (the full JSON verdict), `escalated_at` (parked awaiting a human; stops the hourly retry), `attempts`, `notified_at` (reporter has been told).
 
 ## Auth + sessions
 
