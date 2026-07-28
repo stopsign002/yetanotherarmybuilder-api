@@ -132,6 +132,43 @@ BEGIN
     UPDATE users SET is_admin = TRUE WHERE username = 'stopsign002';
   END IF;
 END $$;
+
+-- Automated bug triage (bug-fixer.sh, hourly). The reporter may leave an
+-- optional email to be told when their report is resolved; everything else
+-- here is state for the hourly job so it can be interrupted and resumed:
+--   escalated_at  the run that gave up and asked the operator for help. Set
+--                 once, so a bug awaiting a human isn't re-attempted every
+--                 hour and doesn't re-send the same email 24 times a day.
+--   notified_at   the reporter has been told. Separate from fixed_at because
+--                 a bug fixed BY HAND in the admin panel still owes its
+--                 reporter a note, and the hourly job is the only sender.
+--   fix_mode      'auto' (verified and applied unattended) or 'intervention'
+--                 (a human finished it) — the reporter's email says which.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND table_name   = 'bug_reports'
+      AND column_name  = 'email'
+  ) THEN
+    ALTER TABLE bug_reports
+      ADD COLUMN email        TEXT        NULL,
+      ADD COLUMN fix_mode     TEXT        NULL,
+      ADD COLUMN fix_report   TEXT        NULL,
+      ADD COLUMN escalated_at TIMESTAMPTZ NULL,
+      ADD COLUMN attempts     INTEGER     NOT NULL DEFAULT 0,
+      ADD COLUMN notified_at  TIMESTAMPTZ NULL;
+
+    -- Reports that predate this feature are already dealt with; don't let the
+    -- first run of the hourly job treat the whole backlog as fresh work.
+    UPDATE bug_reports SET notified_at = now() WHERE fixed = TRUE;
+  END IF;
+END $$;
+
+-- Work queue for the hourly fixer: open and not yet escalated to a human.
+CREATE INDEX IF NOT EXISTS bug_reports_actionable
+  ON bug_reports (created_at) WHERE fixed = FALSE AND escalated_at IS NULL;
 `;
 
 export async function migrate() {
