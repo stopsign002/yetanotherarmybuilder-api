@@ -43,13 +43,15 @@ export async function stateRoutes(app) {
 
     const { rows } = await query(
       `INSERT INTO state_bags (user_id, payload, updated_at)
-            VALUES ($1, $2, $3)
+            VALUES ($1, $2, LEAST($3::timestamptz, now()))
        ON CONFLICT (user_id) DO UPDATE
               SET payload    = CASE WHEN EXCLUDED.updated_at >= state_bags.updated_at THEN EXCLUDED.payload    ELSE state_bags.payload    END,
                   updated_at = CASE WHEN EXCLUDED.updated_at >= state_bags.updated_at THEN EXCLUDED.updated_at ELSE state_bags.updated_at END
-        RETURNING updated_at`,
+        RETURNING updated_at,
+                  (updated_at = LEAST($3::timestamptz, now())) AS applied`,
       [u.user_id, payload, ts]
     );
-    return { updated_at: rows[0].updated_at.toISOString() };
+    // Same clock clamp and `applied` flag as PUT /armies/:id — see armies.js.
+    return { updated_at: rows[0].updated_at.toISOString(), applied: rows[0].applied === true };
   });
 }

@@ -80,21 +80,34 @@ export async function armiesRoutes(app) {
     // Last-write-wins on updated_at: if incoming timestamp is older than what
     // we have, keep the existing row but echo the stored timestamp so the
     // client can reconcile.
+    //
+    // The client's clock is clamped to the server's (LEAST(ts, now())) before
+    // it is compared or stored. Without that, one device with a fast clock
+    // writes a future-dated row and every correctly-set device then loses
+    // the >= race until wall-clock time catches up — a silent lockout with
+    // no error anywhere (yetanotherarmybuilder-api#1). A client may be early
+    // but never in the future.
+    //
+    // `applied` says whether THIS write landed. The upsert always "updates"
+    // the row (often to its own values), so rowCount is 1 either way and the
+    // echoed updated_at alone can't distinguish "your write won" from "your
+    // clock was clamped" — both differ from what was sent.
     const { rows } = await query(
       `INSERT INTO armies (id, user_id, name, payload, updated_at)
-            VALUES ($1, $2, $3, $4, $5)
+            VALUES ($1, $2, $3, $4, LEAST($5::timestamptz, now()))
        ON CONFLICT (id) DO UPDATE
               SET name       = CASE WHEN armies.user_id = EXCLUDED.user_id AND EXCLUDED.updated_at >= armies.updated_at THEN EXCLUDED.name       ELSE armies.name       END,
                   payload    = CASE WHEN armies.user_id = EXCLUDED.user_id AND EXCLUDED.updated_at >= armies.updated_at THEN EXCLUDED.payload    ELSE armies.payload    END,
                   updated_at = CASE WHEN armies.user_id = EXCLUDED.user_id AND EXCLUDED.updated_at >= armies.updated_at THEN EXCLUDED.updated_at ELSE armies.updated_at END
-        RETURNING user_id, updated_at`,
+        RETURNING user_id, updated_at,
+                  (updated_at = LEAST($5::timestamptz, now())) AS applied`,
       [id, u.user_id, name, payload, ts]
     );
     const row = rows[0];
     if (Number(row.user_id) !== u.user_id) {
       return reply.code(403).send({ error: 'Army belongs to another user.' });
     }
-    return { id, updated_at: row.updated_at.toISOString() };
+    return { id, updated_at: row.updated_at.toISOString(), applied: row.applied === true };
   });
 
   app.delete('/armies/:id', async (req, reply) => {

@@ -54,10 +54,10 @@ All require a session. Body limit is the global Fastify `bodyLimit: 2_000_000`. 
 |---|---|---|---|---|
 | GET | `/armies` | — | `200 [{ id, name, updated_at }]` ordered by `updated_at DESC` | `401` |
 | GET | `/armies/:id` | — | `200 { id, name, payload, updated_at }` | `400` bad id, `401`, `404` |
-| PUT | `/armies/:id` | `{ name, payload, updated_at }` | `200 { id, updated_at }` (server-canonical ts; LWW — see below) | `400` bad id/name/payload, `401`, `403` id belongs to another user |
+| PUT | `/armies/:id` | `{ name, payload, updated_at }` | `200 { id, updated_at, applied }` (server-canonical ts; LWW — see below) | `400` bad id/name/payload, `401`, `403` id belongs to another user |
 | DELETE | `/armies/:id` | — | `204` | `400` bad id, `401` |
 
-Field caps: `name ≤ 200`, `payload ≤ 1_000_000`, `id` matches `/^[A-Za-z0-9_-]{1,128}$/`. `updated_at` is parsed with `Date.parse`; if missing/invalid the server uses `new Date()`.
+Field caps: `name ≤ 200`, `payload ≤ 1_000_000`, `id` matches `/^[A-Za-z0-9_-]{1,128}$/`. `updated_at` is parsed with `Date.parse`; if missing/invalid the server uses `new Date()`. Either way it is clamped to the DB clock (`LEAST(ts, now())`) before it is compared or stored — a client may be early but never in the future. `applied` is `true` when this write landed and `false` when the row kept a newer write.
 
 ### State (KV bag)
 
@@ -66,9 +66,9 @@ Single per-user opaque blob. Same LWW behavior as armies.
 | Method | Path | Body | Success | Errors |
 |---|---|---|---|---|
 | GET | `/state` | — | `200 { payload, updated_at }`, or `200 null` if none | `401` |
-| PUT | `/state` | `{ payload, updated_at }` | `200 { updated_at }` | `400` bad payload, `401` |
+| PUT | `/state` | `{ payload, updated_at }` | `200 { updated_at, applied }` | `400` bad payload, `401` |
 
-`payload ≤ 1_000_000` chars. `updated_at` parsing identical to armies.
+`payload ≤ 1_000_000` chars. `updated_at` parsing, clamping and `applied` identical to armies.
 
 ### Images (card-back library)
 
@@ -230,12 +230,12 @@ To bootstrap a different operator, change the username in the `UPDATE … is_adm
 
 ## Last-write-wins
 
-Both `PUT /armies/:id` and `PUT /state` use a single-statement `INSERT … ON CONFLICT … DO UPDATE` where each updatable column is wrapped in a `CASE` that compares `EXCLUDED.updated_at >= existing.updated_at`. If the incoming ts is older, the existing row is preserved and the `RETURNING updated_at` echoes the **stored** ts back to the client, which uses that to detect that its push lost.
+Both `PUT /armies/:id` and `PUT /state` use a single-statement `INSERT … ON CONFLICT … DO UPDATE` where each updatable column is wrapped in a `CASE` that compares `EXCLUDED.updated_at >= existing.updated_at`. If the incoming ts is older, the existing row is preserved and the `RETURNING updated_at` echoes the **stored** ts back to the client. The response also carries `applied` (stored ts equals the clamped incoming ts), because the upsert always "updates" the row — `rowCount` is 1 either way — and the echo alone cannot tell a lost write from a clamped clock. The incoming ts is clamped with `LEAST($n::timestamptz, now())` in the same statement: a device with a fast clock used to write a future-dated row and silently lock every other device out of that army until wall-clock time caught up (api#1).
 
 ```sql
 -- armies upsert (abbrev.)
 INSERT INTO armies (id, user_id, name, payload, updated_at)
-     VALUES ($1, $2, $3, $4, $5)
+     VALUES ($1, $2, $3, $4, LEAST($5::timestamptz, now()))
 ON CONFLICT (id) DO UPDATE
        SET name       = CASE WHEN armies.user_id = EXCLUDED.user_id
                               AND EXCLUDED.updated_at >= armies.updated_at
@@ -246,10 +246,11 @@ ON CONFLICT (id) DO UPDATE
            updated_at = CASE WHEN armies.user_id = EXCLUDED.user_id
                               AND EXCLUDED.updated_at >= armies.updated_at
                           THEN EXCLUDED.updated_at ELSE armies.updated_at END
- RETURNING user_id, updated_at;
+ RETURNING user_id, updated_at,
+           (updated_at = LEAST($5::timestamptz, now())) AS applied;
 ```
 
-A tighter timestamp comparison (e.g. epoch-ms `BIGINT` instead of `TIMESTAMPTZ`) was considered and dropped — Postgres `TIMESTAMPTZ` already compares at microsecond resolution, the client clock is the source of truth, and ties (`>=` vs `>`) deterministically prefer the incoming write, which matches the frontend's "I just saved, my ts is canonical" expectation.
+A tighter timestamp comparison (e.g. epoch-ms `BIGINT` instead of `TIMESTAMPTZ`) was considered and dropped — Postgres `TIMESTAMPTZ` already compares at microsecond resolution, the client clock is the source of truth (clamped to the server's, never ahead of it), and ties (`>=` vs `>`) deterministically prefer the incoming write, which matches the frontend's "I just saved, my ts is canonical" expectation.
 
 **Cross-user PUT.** The `armies` `ON CONFLICT (id)` matches by primary key only, so a user PUT'ing an id that already belongs to a different user would otherwise hit the `CASE WHEN armies.user_id = EXCLUDED.user_id …` guard, which evaluates false and leaves the row untouched. The handler then checks `Number(row.user_id) !== u.user_id` against the `RETURNING user_id` and returns `403 { error: 'Army belongs to another user.' }` **without writing**. Don't remove the `Number(...)` cast — `pg` returns `BIGINT` as a string and `'1' !== 1` would always 403.
 
@@ -336,7 +337,7 @@ Standard caveats: `chmod 600 .env`, never echo to chat output, never commit. `.d
 
 - **Cookie name `yaab_sid`.** The frontend's `js/app/auth.js` (and the sync layer) assume this exact name. Renaming requires a coordinated frontend change and silent-logs-everyone-out at deploy.
 - **Response shapes** — the frontend's `js/app/sync.js` reads these literal keys:
-  - `PUT /armies/:id` → `{ id, updated_at }`. The `updated_at` is what the runOp fallback compares against the ts the client sent.
+  - `PUT /armies/:id` → `{ id, updated_at, applied }`. `applied` is what runOp reads to know whether its write landed; on older builds without it the client falls back to comparing `updated_at` against the ts it sent.
   - `PUT /state` → `{ updated_at }`.
   - `GET /armies` → array of `{ id, name, updated_at }` (summary, no `payload`).
   - `GET /armies/:id` → full `{ id, name, payload, updated_at }`.
@@ -351,7 +352,7 @@ Standard caveats: `chmod 600 .env`, never echo to chat output, never commit. `.d
   - `GET /admin/bugs` / `POST /admin/bugs/:id/{fix,unfix}` → exact field names; `fix`/`unfix` return the **updated** record (the client merges in the response, falling back to a local patch only if the response is `{ ok: true }`).
   - `POST /bugs` → `{ id }` (number). The client uses this to know the report landed.
   Don't add fields that overlap existing names; don't drop any of these.
-- **LWW echo behavior on PUT.** Frontend `runOp` has a fallback that, when the server's returned `updated_at` differs from the ts the client sent, pulls the cloud copy and reconciles. If you change PUT to silently take the newer of the two without echoing the stored ts on a lost write, the client will think its push won and the conflict gets papered over.
+- **LWW echo behavior on PUT.** Frontend `runOp` has a fallback that, when the server's returned `updated_at` differs from the ts the client sent, pulls the cloud copy and reconciles. If you change PUT to silently take the newer of the two without echoing the stored ts on a lost write, the client will think its push won and the conflict gets papered over. `applied` is the explicit signal (since 2026-09-12); `applied: true` with a different `updated_at` means the client's clock was clamped, and the client pins its local ts to the echo rather than pulling.
 - **`Number(row.user_id)` cast in `armies.js`.** `pg`'s default BIGINT-as-string means `row.user_id === u.user_id` is always false. The cross-user 403 check requires the explicit cast. Same applies anywhere else you read a BIGINT column and compare it to `req.user.user_id`.
 - **`ID_RE` in `armies.js`.** Don't tighten it back to UUID-only — the client emits short ids. If you tighten it at all, coordinate with the client id generator first.
 - **Idempotent migrations.** `migrate()` runs on every boot. Any new DDL added to `SCHEMA` must be safe to re-run (use `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `DO $$ … IF NOT EXISTS … $$` blocks for ALTERs).
