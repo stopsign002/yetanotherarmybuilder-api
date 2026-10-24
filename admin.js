@@ -1,3 +1,6 @@
+import { createReadStream } from 'node:fs';
+import { stat } from 'node:fs/promises';
+import { attachmentPath, extForMime, removeAttachment } from './attachments.js';
 import { query } from './db.js';
 import { deleteAllUserSessions } from './sessions.js';
 
@@ -27,6 +30,10 @@ function bugRowToRecord(r) {
   return {
     id:          Number(r.id),
     username:    r.username,
+    kind:        r.kind || 'bug',
+    attachment_url:  r.attachment_file ? `/api/admin/bugs/${Number(r.id)}/attachment` : null,
+    attachment_mime: r.attachment_mime || null,
+    attachment_size: r.attachment_size != null ? Number(r.attachment_size) : null,
     title:       r.title,
     description: r.description,
     diagnostics: r.diagnostics,
@@ -160,7 +167,8 @@ export async function adminRoutes(app) {
     if (!u) return;
     const { rows } = await query(
       `SELECT id, username, title, description, diagnostics,
-              fixed, fixed_at, fixed_by, fixed_note, created_at
+              fixed, fixed_at, fixed_by, fixed_note, created_at,
+              kind, attachment_file, attachment_mime, attachment_size
          FROM bug_reports
         ORDER BY created_at DESC, id DESC`
     );
@@ -195,7 +203,8 @@ export async function adminRoutes(app) {
               fixed_note = $2
         WHERE id = $3
         RETURNING id, username, title, description, diagnostics,
-                  fixed, fixed_at, fixed_by, fixed_note, created_at`,
+                  fixed, fixed_at, fixed_by, fixed_note, created_at,
+              kind, attachment_file, attachment_mime, attachment_size`,
       [u.username, note, idStr]
     );
     if (rows.length === 0) return reply.code(404).send({ error: 'not found' });
@@ -217,7 +226,8 @@ export async function adminRoutes(app) {
               fixed_note = NULL
         WHERE id = $1
         RETURNING id, username, title, description, diagnostics,
-                  fixed, fixed_at, fixed_by, fixed_note, created_at`,
+                  fixed, fixed_at, fixed_by, fixed_note, created_at,
+              kind, attachment_file, attachment_mime, attachment_size`,
       [idStr]
     );
     if (rows.length === 0) return reply.code(404).send({ error: 'not found' });
@@ -231,11 +241,36 @@ export async function adminRoutes(app) {
     if (!/^[0-9]{1,20}$/.test(idStr)) {
       return reply.code(404).send({ error: 'not found' });
     }
-    const { rowCount } = await query(
-      'DELETE FROM bug_reports WHERE id = $1',
+    const { rows } = await query(
+      'DELETE FROM bug_reports WHERE id = $1 RETURNING attachment_file',
       [idStr]
     );
-    if (rowCount === 0) return reply.code(404).send({ error: 'not found' });
+    if (rows.length === 0) return reply.code(404).send({ error: 'not found' });
+    if (rows[0].attachment_file) await removeAttachment(rows[0].attachment_file);
     return reply.code(204).send();
+  });
+
+  // The report's screenshot / recording. Admin only — reporters attach their
+  // own screens, which can show anything. Sandbox CSP + nosniff so even a
+  // mislabelled file can never run as a page on this origin.
+  app.get('/admin/bugs/:id/attachment', async (req, reply) => {
+    const u = requireAdmin(req, reply);
+    if (!u) return;
+    const idStr = req.params.id;
+    if (!/^[0-9]{1,20}$/.test(idStr)) return reply.code(404).send({ error: 'not found' });
+    const { rows } = await query(
+      'SELECT attachment_file, attachment_mime FROM bug_reports WHERE id = $1', [idStr]);
+    const p = rows[0] && attachmentPath(rows[0].attachment_file);
+    if (!p || !extForMime(rows[0].attachment_mime)) return reply.code(404).send({ error: 'not found' });
+    let st;
+    try { st = await stat(p); } catch (_) { return reply.code(404).send({ error: 'not found' }); }
+    return reply
+      .header('Content-Type', rows[0].attachment_mime)
+      .header('Content-Length', st.size)
+      .header('Content-Disposition', 'inline')
+      .header('X-Content-Type-Options', 'nosniff')
+      .header('Content-Security-Policy', "default-src 'none'; img-src 'self'; media-src 'self'; sandbox")
+      .header('Cache-Control', 'private, max-age=3600')
+      .send(createReadStream(p));
   });
 }

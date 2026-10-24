@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
 import rateLimit from '@fastify/rate-limit';
+import multipart from '@fastify/multipart';
 
 import { migrate, waitForDb, pool } from './db.js';
 import { COOKIE_NAME, loadSession } from './sessions.js';
@@ -25,6 +26,12 @@ await app.register(rateLimit, {
   global: false,
   max: 60,
   timeWindow: '1 minute',
+});
+
+// Only POST /bugs takes multipart (an optional screenshot / recording). One
+// file, 50 MB, a handful of short text fields; everything else stays JSON.
+await app.register(multipart, {
+  limits: { fileSize: 50 * 1024 * 1024, files: 1, fields: 10, fieldSize: 20_000, parts: 12 },
 });
 
 app.decorateRequest('user', null);

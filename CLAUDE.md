@@ -16,6 +16,7 @@ Fastify backend for yaab. Provides username/password auth, per-user army sync, a
 | `state.js` | `GET /state` and `PUT /state`. Single KV bag per user, same LWW pattern as armies. |
 | `images.js` | All `/images*` routes — per-user card-back image library for Cards mode. Route-level `bodyLimit: 10_000_000`; advisory-lock-protected count→insert for the 30-image cap. |
 | `admin.js` | All `/admin/*` routes — site-operator panel: approve/revoke users, list+delete any user's image, manage bug reports, lightweight pending-approval counter. Every handler runs through `requireAdmin()` (401 unauth, 403 non-admin). |
+| `attachments.js` | Bug-report attachment storage: MIME allowlist (raster images + video, never SVG), streams to `BUG_ATTACH_DIR` (`/data/bug-attachments`, bind-mounted from `../data/bug-attachments` — under `data/` so `backup.sh` skips it), removal on delete or failed insert. |
 | `bugs.js` | `POST /bugs` only — any signed-in user can submit a bug report. Admin browsing/management lives in `admin.js` under `/admin/bugs`. |
 | `Dockerfile` | Two-stage `node:22-bookworm-slim` build (build stage installs argon2 native deps; runtime stage runs as `node`). `EXPOSE 3000`, `CMD ["node", "server.js"]`. |
 | `package.json` | ESM (`"type": "module"`), Node ≥22. Deps: `fastify@^5`, `@fastify/cookie@^11`, `@fastify/rate-limit@^10`, `pg@^8`, `argon2@^0.41`. |
@@ -94,7 +95,8 @@ All routes require `req.user.is_admin === true` — `requireAdmin()` returns 401
 | GET | `/admin/images` | — | `200 [{ id, owner, name, dataUrl, addedAt }]` newest first across all users | `401`, `403` |
 | DELETE | `/admin/images/:id` | — | `204` | `401`, `403`, `404` |
 | GET | `/admin/users/pending-count` | — | `200 { count }` — count of `approved=FALSE AND revoked=FALSE`. Optional optimisation; client falls back to counting `/admin/users` itself | `401`, `403` |
-| GET | `/admin/bugs` | — | `200 [{ id, username, title, description, diagnostics, fixed, fixed_at, fixed_by, fixed_note, created_at }]` newest first; ts ms-epoch | `401`, `403` |
+| GET | `/admin/bugs` | — | `200 [{ id, username, title, description, diagnostics, fixed, fixed_at, fixed_by, fixed_note, created_at, kind, attachment_url, attachment_mime, attachment_size }]` newest first; ts ms-epoch | `401`, `403` |
+| GET | `/admin/bugs/:id/attachment` | — | the report's file, streamed with its MIME, `nosniff` and a `sandbox` CSP (Caddy sets the same CSP for this path — its site-wide `header` would otherwise replace ours) | `401`, `403`, `404` |
 | POST | `/admin/bugs/:id/fix` | optional `{ note }` | `200 <updated record>`; sets `fixed=TRUE, fixed_at=now(), fixed_by=<admin>, fixed_note=note??NULL` | `400` note too long, `401`, `403`, `404` |
 | POST | `/admin/bugs/:id/unfix` | — | `200 <updated record>`; clears all `fixed_*` columns | `401`, `403`, `404` |
 | DELETE | `/admin/bugs/:id` | — | `204` | `401`, `403`, `404` |
@@ -105,7 +107,7 @@ All routes require `req.user.is_admin === true` — `requireAdmin()` returns 401
 
 | Method | Path | Auth | Body | Success | Errors |
 |---|---|---|---|---|---|
-| POST | `/bugs` | session | `{ title, description, diagnostics?, email? }` | `200 { id }` | `400` empty/oversized/malformed field, `401` |
+| POST | `/bugs` | session | JSON `{ kind?, title, description, diagnostics?, email? }`, **or** `multipart/form-data` with the same text fields + one optional `attachment` file part (image/video only, ≤50 MB) | `200 { id }` | `400` empty/oversized/malformed field, `401`, `413` file too large, `415` not an image/video (SVG is refused on purpose) |
 
 Caps: `title` ≤ 200, `description` ≤ 4000, `diagnostics` ≤ 16_000, `email` ≤ 254 chars. `username` is stored as a snapshot string (not a FK to `users.username`), so reports survive revoke or future user-deletion.
 

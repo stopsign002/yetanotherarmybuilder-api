@@ -166,6 +166,16 @@ BEGIN
   END IF;
 END $$;
 
+-- Report kind + optional screenshot / recording (docs/ADMIN_API.md §5 in the
+-- app repo). The file itself lives on disk under BUG_ATTACH_DIR (a bind mount,
+-- ./data/bug-attachments on the host — excluded from the nightly backup on
+-- purpose); the row records its server-generated filename, MIME and size.
+ALTER TABLE bug_reports
+  ADD COLUMN IF NOT EXISTS kind            TEXT   NOT NULL DEFAULT 'bug',
+  ADD COLUMN IF NOT EXISTS attachment_file TEXT   NULL,
+  ADD COLUMN IF NOT EXISTS attachment_mime TEXT   NULL,
+  ADD COLUMN IF NOT EXISTS attachment_size BIGINT NULL;
+
 -- Work queue for the hourly fixer: open and not yet escalated to a human.
 CREATE INDEX IF NOT EXISTS bug_reports_actionable
   ON bug_reports (created_at) WHERE fixed = FALSE AND escalated_at IS NULL;
