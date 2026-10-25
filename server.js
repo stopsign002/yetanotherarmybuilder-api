@@ -4,7 +4,10 @@ import rateLimit from '@fastify/rate-limit';
 import multipart from '@fastify/multipart';
 
 import { migrate, waitForDb, pool } from './db.js';
-import { COOKIE_NAME, loadSession } from './sessions.js';
+import {
+  COOKIE_NAME, SESSION_TTL_MS, SESSION_RENEW_AFTER_MS,
+  loadSession, touchSession, pruneSessions, cookieOpts,
+} from './sessions.js';
 import { authRoutes } from './auth.js';
 import { armiesRoutes } from './armies.js';
 import { stateRoutes } from './state.js';
@@ -36,7 +39,7 @@ await app.register(multipart, {
 
 app.decorateRequest('user', null);
 
-app.addHook('preHandler', async (req) => {
+app.addHook('preHandler', async (req, reply) => {
   const sid = req.cookies?.[COOKIE_NAME];
   if (!sid) return;
   const session = await loadSession(sid);
@@ -50,6 +53,19 @@ app.addHook('preHandler', async (req) => {
       is_admin: !!session.is_admin,
       session_id: session.session_id,
     };
+    // Sliding expiry: if the row was last extended more than RENEW_AFTER ago,
+    // push it out to a full TTL and re-send the cookie so Max-Age moves too.
+    // Never on logout, and a failure here must not fail the request.
+    const remaining = new Date(session.expires_at).getTime() - Date.now();
+    if (remaining < SESSION_TTL_MS - SESSION_RENEW_AFTER_MS
+        && !String(req.url).startsWith('/auth/logout')) {
+      try {
+        await touchSession(sid);
+        reply.setCookie(COOKIE_NAME, sid, cookieOpts());
+      } catch (err) {
+        req.log.warn({ err }, 'session touch failed');
+      }
+    }
   }
 });
 
@@ -75,5 +91,16 @@ app.log.info('waiting for postgres');
 await waitForDb();
 app.log.info('running migrations');
 await migrate();
+
+async function runPrune() {
+  try {
+    const n = await pruneSessions();
+    app.log.info({ pruned: n }, `pruned ${n} expired sessions`);
+  } catch (err) {
+    app.log.warn({ err }, 'session prune failed');
+  }
+}
+await runPrune();
+setInterval(runPrune, 24 * 60 * 60 * 1000).unref();
 
 await app.listen({ host: HOST, port: PORT });

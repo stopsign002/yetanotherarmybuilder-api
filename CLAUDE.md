@@ -2,7 +2,7 @@
 
 ## What this is
 
-Fastify backend for yaab. Provides username/password auth, per-user army sync, and an opaque KV state-bag, all behind a 30-day server-stored session cookie. Served behind the host's shared Caddy at `https://yaab.thewheeliebois.com/api/*`; Caddy strips the `/api` prefix before reaching the container, so route handlers register clean paths (`/auth/login`, not `/api/auth/login`). Container is named `yaab-api`, joins the external `web` Docker network, and reaches Postgres at host `postgres`. See `~/sites/CLAUDE.md` for the host infra and `../CLAUDE.md` for the original spec.
+Fastify backend for yaab. Provides username/password auth, per-user army sync, and an opaque KV state-bag, all behind a sliding one-year server-stored session cookie. Served behind the host's shared Caddy at `https://yaab.thewheeliebois.com/api/*`; Caddy strips the `/api` prefix before reaching the container, so route handlers register clean paths (`/auth/login`, not `/api/auth/login`). Container is named `yaab-api`, joins the external `web` Docker network, and reaches Postgres at host `postgres`. See `~/sites/CLAUDE.md` for the host infra and `../CLAUDE.md` for the original spec.
 
 ## Layout
 
@@ -10,7 +10,7 @@ Fastify backend for yaab. Provides username/password auth, per-user army sync, a
 |---|---|
 | `server.js` | Fastify entry. Registers `@fastify/cookie` + `@fastify/rate-limit`, decorates `req.user`, runs the session-loading `preHandler`, mounts `authRoutes` / `armiesRoutes` / `stateRoutes` / `imagesRoutes`, exposes `/healthz`. Calls `waitForDb()` then `migrate()` before `app.listen`. SIGINT/SIGTERM close the server and the pg pool. |
 | `db.js` | `pg.Pool` (max 10), `query()`, `waitForDb()` (30 retries × 1s), `migrate()`. Holds the `SCHEMA` DDL constant. |
-| `sessions.js` | Cookie name + TTL constants. `createSession`, `loadSession`, `deleteSession`, `deleteAllUserSessions`, `cookieOpts`, `clearCookieOpts`. |
+| `sessions.js` | Cookie name + TTL constants. `createSession`, `loadSession`, `touchSession`, `pruneSessions`, `deleteSession`, `deleteAllUserSessions`, `cookieOpts`, `clearCookieOpts`. |
 | `auth.js` | All `/auth/*` routes. argon2id hashing, recovery-code generation, per-route 5/min rate limit on register/login/recover. |
 | `armies.js` | All `/armies/*` routes. Client-id regex `ID_RE`, LWW upsert via `INSERT … ON CONFLICT … CASE`. |
 | `state.js` | `GET /state` and `PUT /state`. Single KV bag per user, same LWW pattern as armies. |
@@ -119,7 +119,9 @@ Columns the hourly fixer owns — the API only ever writes `email`: `fix_mode` (
 
 - Hashing: **argon2id**, default params (`argon2.hash(value, { type: argon2.argon2id })`). Same for password and recovery-code hashes.
 - Session id: 32 random bytes, `base64url`-encoded (`crypto.randomBytes(32).toString('base64url')`).
-- TTL: 30 days (`SESSION_TTL_MS` in `sessions.js`). Stored in `sessions` table; `loadSession` filters `expires_at > now()`.
+- TTL: **365 days, sliding** (`SESSION_TTL_MS` in `sessions.js`; was a hard 30 days from login until 2026-10-25). Stored in `sessions` table; `loadSession` filters `expires_at > now()`.
+- Renewal: in the `preHandler`, when a session loads for a non-revoked user and `expires_at - now() < SESSION_TTL_MS - SESSION_RENEW_AFTER_MS` (24 h, i.e. the row was last extended more than a day ago), `touchSession(sid)` sets `expires_at = now() + 365 days` and the handler re-sends the `yaab_sid` cookie so the browser's `Max-Age` moves with it. Skipped for `/auth/logout`; a touch failure is logged (`warn`) and never fails the request. Old 30-day rows extend on their next request — no migration.
+- Prune: `pruneSessions()` (`DELETE FROM sessions WHERE expires_at < now()`) runs once after `migrate()` and every 24 h (`setInterval(...).unref()`); the row count is logged at `info`.
 - Cookie: name **`yaab_sid`**, attrs `{ path: '/', httpOnly: true, secure: true, sameSite: 'lax', maxAge: <ttl-seconds> }`. Clear-cookie uses the same attrs with `maxAge: 0`. `@fastify/cookie` is registered with `secret: process.env.SESSION_SECRET`.
 - Recovery code: generated at register with `randomBytes(18).toString('base64url')`, returned **once** in the register response, stored only as an argon2 hash. `/auth/recover` rotates it (returns a fresh one) and **deletes all sessions for that user** before issuing a new one. `/auth/change-password` keeps the current session but deletes all others.
 - `req.user`: populated by the `preHandler` hook in `server.js` — reads `req.cookies.yaab_sid`, calls `loadSession`, attaches `{ user_id: Number(...), username, is_admin, session_id }` (note: `user_id` is coerced from BIGINT-as-string to JS number here; downstream code that compares against a `row.user_id` from a fresh query must do the same — see armies.js's `Number(row.user_id) !== u.user_id`). The preHandler also leaves `req.user` null when the loaded session belongs to a `revoked = TRUE` user, so a revoked user's still-valid cookie behaves like signed-out (the session row gets wiped on revoke too — belt-and-braces).
