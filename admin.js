@@ -6,6 +6,8 @@ import { deleteAllUserSessions } from './sessions.js';
 
 const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
 const FIX_NOTE_MAX = 4000;
+// Numeric ids below are capped at 18 digits: always within BIGINT, so an
+// oversized id is a 404 instead of a Postgres "out of range" 500.
 
 function requireAdmin(req, reply) {
   if (!req.user) {
@@ -136,7 +138,7 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const idStr = req.params.id;
-    if (!/^[0-9]{1,20}$/.test(idStr)) {
+    if (!/^[0-9]{1,18}$/.test(idStr)) {
       return reply.code(404).send({ error: 'not found' });
     }
     const { rowCount } = await query(
@@ -179,7 +181,7 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const idStr = req.params.id;
-    if (!/^[0-9]{1,20}$/.test(idStr)) {
+    if (!/^[0-9]{1,18}$/.test(idStr)) {
       return reply.code(404).send({ error: 'not found' });
     }
 
@@ -215,7 +217,7 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const idStr = req.params.id;
-    if (!/^[0-9]{1,20}$/.test(idStr)) {
+    if (!/^[0-9]{1,18}$/.test(idStr)) {
       return reply.code(404).send({ error: 'not found' });
     }
     const { rows } = await query(
@@ -238,7 +240,7 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const idStr = req.params.id;
-    if (!/^[0-9]{1,20}$/.test(idStr)) {
+    if (!/^[0-9]{1,18}$/.test(idStr)) {
       return reply.code(404).send({ error: 'not found' });
     }
     const { rows } = await query(
@@ -257,7 +259,7 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const idStr = req.params.id;
-    if (!/^[0-9]{1,20}$/.test(idStr)) return reply.code(404).send({ error: 'not found' });
+    if (!/^[0-9]{1,18}$/.test(idStr)) return reply.code(404).send({ error: 'not found' });
     const { rows } = await query(
       'SELECT attachment_file, attachment_mime FROM bug_reports WHERE id = $1', [idStr]);
     const p = rows[0] && attachmentPath(rows[0].attachment_file);

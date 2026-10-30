@@ -1,7 +1,8 @@
 import argon2 from 'argon2';
 import { randomBytes } from 'node:crypto';
 import { query } from './db.js';
-import { notify } from './mail.js';
+import { kickSignupNotice } from './signup-notify.js';
+import { perUserLimit } from './limits.js';
 import {
   COOKIE_NAME,
   cookieOpts,
@@ -15,6 +16,10 @@ const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
 const MIN_PW = 8;
 const MAX_PW = 256;
 const RECOVERY_BYTES = 18;
+// Registration is refused (503) once this many accounts are awaiting approval.
+// Nothing prunes pending rows, and register needs no login, so without a cap a
+// script could fill the admin Users tab with thousands of them.
+const PENDING_MAX = 25;
 
 function generateRecoveryCode() {
   return randomBytes(RECOVERY_BYTES).toString('base64url');
@@ -48,24 +53,38 @@ export async function authRoutes(app) {
       return badInput(reply, 'Username is already taken.', 409);
     }
 
+    // Before the argon2 work, so a refused request costs one COUNT.
+    const pending = await query(
+      'SELECT COUNT(*)::int AS c FROM users WHERE approved = FALSE AND revoked = FALSE'
+    );
+    if (pending.rows[0].c >= PENDING_MAX) {
+      return badInput(reply, 'Sign-ups are paused while existing requests are reviewed. Try again later.', 503);
+    }
+
     const recoveryCode = generateRecoveryCode();
     const [pwHash, recHash] = await Promise.all([
       argon2.hash(password, { type: argon2.argon2id }),
       argon2.hash(recoveryCode, { type: argon2.argon2id }),
     ]);
 
-    const { rows } = await query(
-      `INSERT INTO users (username, password, recovery_code_hash)
-       VALUES ($1, $2, $3)
-       RETURNING id, username`,
-      [username, pwHash, recHash]
-    );
+    let rows;
+    try {
+      ({ rows } = await query(
+        `INSERT INTO users (username, password, recovery_code_hash)
+         VALUES ($1, $2, $3)
+         RETURNING id, username`,
+        [username, pwHash, recHash]
+      ));
+    } catch (err) {
+      // Two concurrent registrations of one name both pass the SELECT above;
+      // the loser hits the UNIQUE constraint. Same answer as the pre-check.
+      if (err.code === '23505') return badInput(reply, 'Username is already taken.', 409);
+      throw err;
+    }
     const user = rows[0];
 
-    notify(
-      `[yaab] Access request: ${user.username}`,
-      `New user "${user.username}" registered on yaab and is awaiting approval.\n\nApprove/revoke: https://yaab.thewheeliebois.com (Admin → Users)`
-    );
+    // Coalesced: at most one operator mail an hour (signup-notify.js).
+    kickSignupNotice(req.log);
 
     // Approval gating: don't issue a session — admin must approve first.
     // The client (auth-modal.js) reads `pending: true` and shows a
@@ -77,6 +96,12 @@ export async function authRoutes(app) {
     const { username, password } = req.body || {};
     if (typeof username !== 'string' || typeof password !== 'string') {
       return badInput(reply, 'Username and password required.');
+    }
+    // Validate the format before it reaches Postgres: a NUL byte used to come
+    // back as a raw 500 with the SQLSTATE. The rules are public (register
+    // states them), so a 400 here says nothing about which accounts exist.
+    if (!USERNAME_RE.test(username)) {
+      return badInput(reply, 'Invalid username or password.');
     }
 
     const { rows } = await query(
@@ -127,6 +152,9 @@ export async function authRoutes(app) {
     if (typeof username !== 'string' || typeof recoveryCode !== 'string' || typeof newPassword !== 'string') {
       return badInput(reply, 'username, recoveryCode, and newPassword required.');
     }
+    if (!USERNAME_RE.test(username)) {
+      return badInput(reply, 'Invalid username or recovery code.');
+    }
     if (newPassword.length < MIN_PW || newPassword.length > MAX_PW) {
       return badInput(reply, `Password must be ${MIN_PW}–${MAX_PW} characters.`);
     }
@@ -170,7 +198,11 @@ export async function authRoutes(app) {
     return { username: user.username, recoveryCode: newRecoveryCode };
   });
 
-  app.post('/auth/change-password', async (req, reply) => {
+  // Same 5/min as login, but keyed on the signed-in user (IP fallback): a
+  // stolen cookie must not allow unlimited guessing of the current password,
+  // and a flood of argon2 verifies must not stall the 4-thread libuv pool that
+  // every other login shares.
+  app.post('/auth/change-password', perUserLimit(5, '1 minute'), async (req, reply) => {
     if (!req.user) return reply.code(401).send({ error: 'Not signed in.' });
     const { oldPassword, newPassword } = req.body || {};
     if (typeof oldPassword !== 'string' || typeof newPassword !== 'string') {

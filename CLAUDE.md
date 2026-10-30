@@ -8,23 +8,43 @@ Fastify backend for yaab. Provides username/password auth, per-user army sync, a
 
 | Path | Purpose |
 |---|---|
-| `server.js` | Fastify entry. Registers `@fastify/cookie` + `@fastify/rate-limit`, decorates `req.user`, runs the session-loading `preHandler`, mounts `authRoutes` / `armiesRoutes` / `stateRoutes` / `imagesRoutes`, exposes `/healthz`. Calls `waitForDb()` then `migrate()` before `app.listen`. SIGINT/SIGTERM close the server and the pg pool. |
+| `server.js` | Fastify entry. Registers `@fastify/cookie`, `@fastify/rate-limit` (`global: false`) and `@fastify/multipart` (POST /bugs only), attaches the pg pool's `'error'` listener, sets the app error handler (see "Errors"), decorates `req.user`, runs the session-loading `preHandler`, mounts `authRoutes` / `armiesRoutes` / `stateRoutes` / `imagesRoutes` / `adminRoutes` / `bugsRoutes`, exposes `/healthz`. Calls `waitForDb()` then `migrate()`, then starts two timers — the session prune (24 h) and the pending-signup notice sweep (5 min) — before `app.listen`. SIGINT/SIGTERM close the server and the pg pool. |
 | `db.js` | `pg.Pool` (max 10), `query()`, `waitForDb()` (30 retries × 1s), `migrate()`. Holds the `SCHEMA` DDL constant. |
 | `sessions.js` | Cookie name + TTL constants. `createSession`, `loadSession`, `touchSession`, `pruneSessions`, `deleteSession`, `deleteAllUserSessions`, `cookieOpts`, `clearCookieOpts`. |
-| `auth.js` | All `/auth/*` routes. argon2id hashing, recovery-code generation, per-route 5/min rate limit on register/login/recover. |
+| `auth.js` | All `/auth/*` routes. argon2id hashing, recovery-code generation, per-route 5/min rate limit on register/login/recover (per IP) and change-password (per user), the 25-pending registration cap. |
+| `limits.js` | `perUserLimit(max, window, message?)` route options (per-user key, IP fallback, `hook: 'preHandler'`), `userOrIpKey`, `publicError(status, error)`. |
+| `signup-notify.js` | `notifyPendingSignups()` / `kickSignupNotice()`: the operator's "new pending account" mail, coalesced to at most one an hour through the `notify_state` table. |
 | `armies.js` | All `/armies/*` routes. Client-id regex `ID_RE`, LWW upsert via `INSERT … ON CONFLICT … CASE`. |
 | `state.js` | `GET /state` and `PUT /state`. Single KV bag per user, same LWW pattern as armies. |
 | `images.js` | All `/images*` routes — per-user card-back image library for Cards mode. Route-level `bodyLimit: 10_000_000`; advisory-lock-protected count→insert for the 30-image cap. |
 | `admin.js` | All `/admin/*` routes — site-operator panel: approve/revoke users, list+delete any user's image, manage bug reports, lightweight pending-approval counter. Every handler runs through `requireAdmin()` (401 unauth, 403 non-admin). |
 | `attachments.js` | Bug-report attachment storage: MIME allowlist (raster images + video, never SVG), streams to `BUG_ATTACH_DIR` (`/data/bug-attachments`, bind-mounted from `../data/bug-attachments` — under `data/` so `backup.sh` skips it), removal on delete or failed insert. |
-| `bugs.js` | `POST /bugs` only — any signed-in user can submit a bug report. Admin browsing/management lives in `admin.js` under `/admin/bugs`. |
-| `Dockerfile` | Two-stage `node:22-bookworm-slim` build (build stage installs argon2 native deps; runtime stage runs as `node`). `EXPOSE 3000`, `CMD ["node", "server.js"]`. |
-| `package.json` | ESM (`"type": "module"`), Node ≥22. Deps: `fastify@^5`, `@fastify/cookie@^11`, `@fastify/rate-limit@^10`, `pg@^8`, `argon2@^0.41`. |
+| `bugs.js` | `POST /bugs` only — any signed-in user can submit a bug report, within the abuse limits listed under "Bugs". Admin browsing/management lives in `admin.js` under `/admin/bugs`. |
+| `Dockerfile` | Two-stage `node:22-bookworm-slim` build (build stage installs argon2 native deps and runs `npm ci --omit=dev` from the lockfile; runtime stage runs as `node`). `EXPOSE 3000`, `CMD ["node", "server.js"]`. |
+| `package.json` | ESM (`"type": "module"`), Node ≥22. Deps: `fastify@^5`, `@fastify/cookie@^11`, `@fastify/rate-limit@^10`, `@fastify/multipart@^9`, `pg@^8`, `argon2@^0.41`. |
+| `package-lock.json` | Pins the whole tree (committed 2026-10-30, generated from the then-live image's `node_modules`, so it changed no versions: fastify 5.12.7, @fastify/multipart 9.4.0, @fastify/rate-limit 10.3.0, @fastify/cookie 11.1.3, pg 8.23.1, argon2 0.41.1). See "Dependencies". |
 | `.dockerignore` | Excludes `node_modules`, `.git`, `.env*`, `npm-debug.log`. |
 
 ## Endpoints
 
-All routes return JSON unless noted. Bodies are `application/json`. Cookie `yaab_sid` carries the session — set on register/login/recover, cleared on logout.
+All routes return JSON unless noted. Bodies are `application/json` (POST /bugs also takes multipart). Cookie `yaab_sid` carries the session — set on login and recover (**not** on register: the account waits for approval), cleared on logout.
+
+### Rate limits
+
+`@fastify/rate-limit` is registered with `global: false`, so only these routes are limited. Counters live in process memory and reset on every restart.
+
+| Route | Limit | Keyed on | Over the limit |
+|---|---|---|---|
+| `POST /auth/register`, `/auth/login`, `/auth/recover` | 5 / minute | client IP | plugin default `429 { statusCode, error: "Too Many Requests", message }` |
+| `POST /auth/change-password` | 5 / minute | user id (IP if anonymous) | same default shape |
+| `POST /bugs` | 5 / hour | user id (IP if anonymous) | `429 { error: "Too many reports sent. Try again in …" }` |
+| `POST /images` | 30 / hour | user id (IP if anonymous) | `429 { error: "Too many image uploads. Try again in …" }` |
+
+The per-user limits use `limits.js:perUserLimit()`, which sets `hook: 'preHandler'` — **required**, because the plugin's default `onRequest` hook runs before `server.js` loads the session, so `req.user` would be null and every key would silently become the IP. The cost is that a JSON body is parsed before the limit is checked (multipart is not: `/bugs` reads its parts inside the handler). IPs come from `X-Forwarded-For` (`trustProxy: true`); Caddy overwrites that header, so WAN clients cannot pick their own key, but a container on the `web` network that reaches `yaab-api:3000` directly could.
+
+### Errors
+
+`server.js`'s `setErrorHandler`: any thrown error with status ≥ 500 (or none — e.g. a Postgres error) is logged at `error` with its stack and answers **`{ error: "internal" }`**, so no Postgres message, SQLSTATE or constraint name reaches a client. A thrown 4xx carrying `publicBody` (`limits.js:publicError`) sends that body; every other 4xx (invalid JSON, body too large, the auth routes' 429) goes to Fastify's default handler and keeps its usual `{ statusCode, code?, error, message }` shape. Handlers that `reply.code(n).send(...)` directly are unaffected.
 
 ### Health
 
@@ -34,18 +54,20 @@ All routes return JSON unless noted. Bodies are `application/json`. Cookie `yaab
 
 ### Auth
 
-Rate-limited routes (`register`, `login`, `recover`) are capped at **5/min/IP** via `@fastify/rate-limit` (global default is 60/min, see `server.js`).
+`register`, `login` and `recover` are capped at **5/min/IP**, `change-password` at **5/min per user** (see "Rate limits").
 
 | Method | Path | Auth | RL | Body | Success | Errors |
 |---|---|---|---|---|---|---|
-| POST | `/auth/register` | — | 5/min | `{ username, password }` | `200 { username, recoveryCode, pending: true }`; **does NOT set a cookie** — admin must approve first | `400` bad input, `409` username taken |
-| POST | `/auth/login` | — | 5/min | `{ username, password }` | `200 { username, is_admin }` + sets cookie | `400` missing fields, `401` invalid creds, `403 { error: "pending_approval" }`, `403 { error: "revoked" }` |
+| POST | `/auth/register` | — | 5/min | `{ username, password }` | `200 { username, recoveryCode, pending: true }`; **does NOT set a cookie** — admin must approve first | `400` bad input, `409` username taken (also when a concurrent registration of the same name wins the race), `503` sign-ups paused (25 accounts already pending) |
+| POST | `/auth/login` | — | 5/min | `{ username, password }` | `200 { username, is_admin }` + sets cookie | `400` missing fields or a username that fails the format regex, `401` invalid creds, `403 { error: "pending_approval" }`, `403 { error: "revoked" }` |
 | POST | `/auth/logout` | — | — | — | `204` + clears cookie | — |
 | GET | `/auth/me` | session | — | — | `200 { username, is_admin }` | `401` not signed in (revoked users are treated as not-signed-in by the preHandler) |
-| POST | `/auth/recover` | — | 5/min | `{ username, recoveryCode, newPassword }` | `200 { username, recoveryCode }` (NEW code) + sets cookie; **invalidates all other sessions** | `400` bad input, `401` invalid code, `403 pending_approval`, `403 revoked` |
-| POST | `/auth/change-password` | session | — | `{ oldPassword, newPassword }` | `200 { ok: true }`; invalidates all sessions except current | `400` bad input, `401` not signed in / wrong old pw |
+| POST | `/auth/recover` | — | 5/min | `{ username, recoveryCode, newPassword }` | `200 { username, recoveryCode }` (NEW code) + sets cookie; **invalidates all other sessions** | `400` bad input (incl. a malformed username), `401` invalid code, `403 pending_approval`, `403 revoked` |
+| POST | `/auth/change-password` | session | 5/min/user | `{ oldPassword, newPassword }` | `200 { ok: true }`; invalidates all sessions except current | `400` bad input, `401` not signed in / wrong old pw, `429` |
 
-`username` regex: `/^[A-Za-z0-9_.-]{3,32}$/`. `password`: 8–256 chars, no complexity rules. Login does a constant-time argon2 verify against a dummy hash when the user is missing to flatten timing.
+`username` regex: `/^[A-Za-z0-9_.-]{3,32}$/` — enforced on register, and on login/recover before the value reaches Postgres (a NUL byte used to come back as a raw 500 with SQLSTATE `22021`; the format is public, so the 400 leaks nothing). Usernames are unique **case-sensitively**. `password`: 8–256 chars, no complexity rules. Login does an argon2 verify against a dummy hash when the user is missing to flatten timing (measured 202 ms vs 206 ms; do not remove). Register's `409` does reveal that a name exists — only login is existence-blind.
+
+**Registration brakes.** Register needs no login, so: (1) it is refused with `503` once **25** accounts are pending (`approved = FALSE AND revoked = FALSE`), checked before the argon2 work; nothing prunes pending rows, so an admin approving or revoking is what reopens sign-ups. (2) The operator mail is **coalesced to at most one an hour** (`signup-notify.js`): the first registration in a quiet hour mails at once (`[yaab] Access request: <name>`), later ones are batched and the 5-minute sweep in `server.js` sends `[yaab] N new accounts awaiting approval` once the hour is up. Accounts approved or revoked in the meantime are not counted. State is the `notify_state` row, so restarts neither re-send nor forget. Reason: the mailer is the host-wide Gmail relay (~500/day) that backup, restore-drill and login-watch alerts also use; per-registration mail at 5/min/IP could exhaust it in under two hours. Known gaps: a mail the mailer fails to deliver still uses the slot, and an INSERT that commits after a concurrent claim can be skipped by the watermark — the admin pending banner always shows the true count.
 
 ### Armies
 
@@ -81,6 +103,8 @@ Per-user library of card-back images for Cards mode (frontend module: `app/js/ui
 | POST | `/images` | `{ name, dataUrl }` | `200 { id, name, dataUrl, addedAt }` | `400` bad input, `401`, `409 { error:"limit", limit, count }` over cap, `413` per-image too large |
 | DELETE | `/images/:id` | — | `204` | `401`, `404` (also returned when the row exists but belongs to another user — never leak existence) |
 
+`POST /images` is limited to **30 per hour per user** (`429`, see "Rate limits"). Numeric `:id` params here and under `/admin/*` match `/^[0-9]{1,18}$/` — 18 digits always fits a BIGINT, so a longer id is a `404` rather than a Postgres out-of-range 500.
+
 Caps + validation: `name` 1-200 chars (trimmed); `dataUrl` ≤ 7_000_000 chars (≈ 5 MB binary); MIME allowlist `image/png|jpeg|webp|gif|svg+xml` enforced via `DATA_URL_RE` prefix; per-user library cap **30** images. POST has a route-level `bodyLimit: 10_000_000` so a single upload can hold a 5 MB binary plus base64 + JSON envelope without raising the global 2 MB Fastify limit. The cap check + insert run inside one transaction with a `pg_advisory_xact_lock(user_id)` so concurrent POSTs from the same user can't race past the limit. `id` is returned as a JS Number (BIGSERIAL cast in `rowToRecord`); the client treats it opaquely. `addedAt` is ms-epoch.
 
 ### Admin (site-operator panel)
@@ -107,9 +131,20 @@ All routes require `req.user.is_admin === true` — `requireAdmin()` returns 401
 
 | Method | Path | Auth | Body | Success | Errors |
 |---|---|---|---|---|---|
-| POST | `/bugs` | session | JSON `{ kind?, title, description, diagnostics?, email? }`, **or** `multipart/form-data` with the same text fields + one optional `attachment` file part (image/video only, ≤50 MB) | `200 { id }` | `400` empty/oversized/malformed field, `401`, `413` file too large, `415` not an image/video (SVG is refused on purpose) |
+| POST | `/bugs` | session | JSON `{ kind?, title, description, diagnostics?, email? }`, **or** `multipart/form-data` with the same text fields + one optional `attachment` file part (image/video only, ≤50 MB) | `200 { id }` | `400` empty/oversized/malformed field, `401`, `413` file too large or the user's attachment quota full, `415` not an image/video (SVG is refused on purpose), `429` rate limit or open-report cap, `507` attachment refused because the disk is low |
 
-Caps: `title` ≤ 200, `description` ≤ 4000, `diagnostics` ≤ 16_000, `email` ≤ 254 chars. `username` is stored as a snapshot string (not a FK to `users.username`), so reports survive revoke or future user-deletion.
+Caps: `title` ≤ 200, `description` ≤ 4000, `email` ≤ 254 chars. `diagnostics` longer than 16_000 chars is **truncated** to 16_000 (ending `…(truncated by server)…`), not refused — the client's own trim ran 14 chars over the old hard cap and got every long report refused. The multipart `fieldSize` is 64 KiB (it is in bytes), so 16_000 chars of 4-byte UTF-8 survive the multipart path whole and both paths truncate the same way.
+
+**Abuse limits** (api#2 — each report can write a 50 MB file to the host's root filesystem and queues work for the hourly `bug-fixer.py`):
+
+| Limit | Value | Answer |
+|---|---|---|
+| Reports per user | 5 / hour (route rate limit) | `429 { error }` |
+| Open (`fixed = FALSE`) reports per user | 10 | `429 { error }` |
+| Attachment bytes per user | 200 MB, summed over every row that still has a file (fixed or not — the file stays until an admin deletes the report) | `413 { error }` |
+| Free space on `BUG_ATTACH_DIR` (`fs.statfs`, multipart requests only) | refuse below 2 GB | `507 { error }`; JSON reports still go through |
+
+The open-count, quota and disk checks run once before any of the upload is read, and the count and quota run again inside the INSERT's transaction under `pg_advisory_xact_lock(7301, hashtext(username))`, so concurrent submissions cannot slip past them (the two-int lock form is a different key space from the images cap's one-bigint lock). An attachment that would cross the quota is unlinked before the `413`. If `statfs` fails the floor is skipped with a `warn` log rather than blocking reports. Limits are keyed on the `username` snapshot, since `bug_reports` has no user FK. `username` is stored as a snapshot string (not a FK to `users.username`), so reports survive revoke or future user-deletion.
 
 `email` is optional and used for exactly one thing: telling the reporter their report was resolved. A malformed address is **rejected** rather than dropped — silently discarding it means the reporter waits for a note that never arrives. This route deliberately sends **no** mail on submission; `~/sites/base/bug-fixer.py` (hourly) mails either "fixed" or "needs a human" and is the only sender of reporter notifications, including for reports an admin fixes by hand via `/admin/bugs/:id/fix`.
 
@@ -122,14 +157,14 @@ Columns the hourly fixer owns — the API only ever writes `email`: `fix_mode` (
 - TTL: **365 days, sliding** (`SESSION_TTL_MS` in `sessions.js`; was a hard 30 days from login until 2026-10-25). Stored in `sessions` table; `loadSession` filters `expires_at > now()`.
 - Renewal: in the `preHandler`, when a session loads for a non-revoked user and `expires_at - now() < SESSION_TTL_MS - SESSION_RENEW_AFTER_MS` (24 h, i.e. the row was last extended more than a day ago), `touchSession(sid)` sets `expires_at = now() + 365 days` and the handler re-sends the `yaab_sid` cookie so the browser's `Max-Age` moves with it. Skipped for `/auth/logout`; a touch failure is logged (`warn`) and never fails the request. Old 30-day rows extend on their next request — no migration.
 - Prune: `pruneSessions()` (`DELETE FROM sessions WHERE expires_at < now()`) runs once after `migrate()` and every 24 h (`setInterval(...).unref()`); the row count is logged at `info`.
-- Cookie: name **`yaab_sid`**, attrs `{ path: '/', httpOnly: true, secure: true, sameSite: 'lax', maxAge: <ttl-seconds> }`. Clear-cookie uses the same attrs with `maxAge: 0`. `@fastify/cookie` is registered with `secret: process.env.SESSION_SECRET`.
+- Cookie: name **`yaab_sid`**, attrs `{ path: '/', httpOnly: true, secure: true, sameSite: 'lax', maxAge: <ttl-seconds> }`. Clear-cookie uses the same attrs with `maxAge: 0`. `@fastify/cookie` is registered with `secret: process.env.SESSION_SECRET`, but **no `setCookie` passes `signed: true`, so the secret is inert**: the cookie is the bare session id, which is safe because it is 256 random bits looked up server-side.
 - Recovery code: generated at register with `randomBytes(18).toString('base64url')`, returned **once** in the register response, stored only as an argon2 hash. `/auth/recover` rotates it (returns a fresh one) and **deletes all sessions for that user** before issuing a new one. `/auth/change-password` keeps the current session but deletes all others.
 - `req.user`: populated by the `preHandler` hook in `server.js` — reads `req.cookies.yaab_sid`, calls `loadSession`, attaches `{ user_id: Number(...), username, is_admin, session_id }` (note: `user_id` is coerced from BIGINT-as-string to JS number here; downstream code that compares against a `row.user_id` from a fresh query must do the same — see armies.js's `Number(row.user_id) !== u.user_id`). The preHandler also leaves `req.user` null when the loaded session belongs to a `revoked = TRUE` user, so a revoked user's still-valid cookie behaves like signed-out (the session row gets wiped on revoke too — belt-and-braces).
 - **Approval gating**: register doesn't issue a cookie. Login + recover both bounce `revoked=TRUE` users with `403 { error: "revoked" }` and unapproved users with `403 { error: "pending_approval" }`. The bounce is **after** credential verification so existence isn't leaked via timing or status code on bad creds. New admins are made by setting `is_admin=TRUE` directly in the DB — there is intentionally no `/admin/users/:username/promote` endpoint.
 
 ## Schema
 
-All six tables live in the default schema. Created by `migrate()` on every startup via `CREATE TABLE IF NOT EXISTS` so it's safe to re-run. The `users` table also picks up six approval/admin columns via a one-shot `DO $$` block — see "approval gating migration" below.
+All seven tables live in the default schema. Created by `migrate()` on every startup via `CREATE TABLE IF NOT EXISTS` so it's safe to re-run. `users` and `bug_reports` also pick up columns from later migrations (two one-shot `DO $$` blocks and an `ADD COLUMN IF NOT EXISTS`) — the DDL below shows the end state.
 
 ```sql
 CREATE TABLE users (
@@ -184,20 +219,44 @@ CREATE INDEX card_back_images_user_idx
   ON card_back_images (user_id, added_at DESC);
 
 CREATE TABLE bug_reports (
-  id           BIGSERIAL PRIMARY KEY,
-  username     TEXT        NOT NULL,            -- submitter snapshot; NOT a FK by design
-  title        TEXT        NOT NULL,
-  description  TEXT        NOT NULL,
-  diagnostics  TEXT        NULL,
-  fixed        BOOLEAN     NOT NULL DEFAULT FALSE,
-  fixed_at     TIMESTAMPTZ NULL,
-  fixed_by     TEXT        NULL,
-  fixed_note   TEXT        NULL,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+  id               BIGSERIAL PRIMARY KEY,
+  username         TEXT        NOT NULL,        -- submitter snapshot; NOT a FK by design
+  title            TEXT        NOT NULL,
+  description      TEXT        NOT NULL,
+  diagnostics      TEXT        NULL,
+  fixed            BOOLEAN     NOT NULL DEFAULT FALSE,
+  fixed_at         TIMESTAMPTZ NULL,
+  fixed_by         TEXT        NULL,
+  fixed_note       TEXT        NULL,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Added by the bug-fixer DO-block (guarded on bug_reports.email):
+  email            TEXT        NULL,            -- reporter's optional address (API writes this)
+  fix_mode         TEXT        NULL,            -- 'auto' | 'intervention' (bug-fixer.py owns these five)
+  fix_report       TEXT        NULL,
+  escalated_at     TIMESTAMPTZ NULL,
+  attempts         INTEGER     NOT NULL DEFAULT 0,
+  notified_at      TIMESTAMPTZ NULL,
+  -- Added by ALTER TABLE … ADD COLUMN IF NOT EXISTS:
+  kind             TEXT        NOT NULL DEFAULT 'bug',   -- 'bug' | 'feature'
+  attachment_file  TEXT        NULL,            -- server-generated filename under BUG_ATTACH_DIR
+  attachment_mime  TEXT        NULL,
+  attachment_size  BIGINT      NULL
 );
 CREATE INDEX bug_reports_created_at_desc ON bug_reports (created_at DESC);
 CREATE INDEX bug_reports_open            ON bug_reports (fixed) WHERE fixed = FALSE;
+CREATE INDEX bug_reports_actionable      ON bug_reports (created_at)
+  WHERE fixed = FALSE AND escalated_at IS NULL;   -- the hourly fixer's work queue
+
+-- Coalescing state for operator mails (signup-notify.js). Seeded by migrate():
+-- ('signup', '-infinity', <now() on the boot that created it>).
+CREATE TABLE notify_state (
+  kind              TEXT        PRIMARY KEY,
+  sent_at           TIMESTAMPTZ NOT NULL,       -- last mail sent ('-infinity' = never)
+  notified_through  TIMESTAMPTZ NOT NULL        -- created_at of the newest account that mail covered
+);
 ```
+
+The bug-fixer DO-block, when it first ran, also stamped `notified_at = now()` on every already-fixed report so the hourly job did not mail the backlog. The `ALTER TABLE bug_reports ADD COLUMN IF NOT EXISTS …` runs on every boot and takes an ACCESS EXCLUSIVE lock even as a no-op, so a long transaction on `bug_reports` (e.g. the bug-fixer) can delay boot.
 
 ### In-place UUID→TEXT migration
 
@@ -230,7 +289,14 @@ BEGIN
 END $$;
 ```
 
-To bootstrap a different operator, change the username in the `UPDATE … is_admin = TRUE` line **before first deploy** — once the migration's run on a target DB, the guard makes it a no-op and you'll need to flip `is_admin` manually via psql.
+**On a fresh database this block bootstraps nobody.** On the very first boot `users` is empty, so the backfill and the `is_admin` UPDATE match no rows — whatever username is written there — and the guard then makes the block a no-op forever. A fresh install therefore has **no admin**, and the operator's own registration sits pending like any other, so they cannot sign in. The only way in is psql, after registering through the app:
+
+```
+docker exec -i postgres psql -U postgres -d yaab_db -c \
+  "UPDATE users SET approved = TRUE, approved_at = now(), is_admin = TRUE WHERE username = '<you>';"
+```
+
+The `'stopsign002'` bootstrap only ever worked on the existing production DB, where the users predated the migration.
 
 ## Last-write-wins
 
@@ -286,11 +352,24 @@ Run automatically on every container start by `server.js`:
 
 ```
 await waitForDb();   // 30 × 1s SELECT 1 retries
-await migrate();     // pool.query(SCHEMA) — idempotent CREATE TABLE IF NOT EXISTS + UUID→TEXT DO-block
+await migrate();     // pool.query(SCHEMA) — see below
 await app.listen({ host: '0.0.0.0', port: PORT });
 ```
 
+`SCHEMA` is, in order: the `CREATE TABLE/INDEX IF NOT EXISTS` statements, the UUID→TEXT `DO` block, the approval-gating `DO` block (guarded on `users.approved`), the bug-fixer `DO` block (guarded on `bug_reports.email`), the `ALTER TABLE bug_reports ADD COLUMN IF NOT EXISTS kind, attachment_*`, the `bug_reports_actionable` index, and the `notify_state` table plus its `INSERT … ON CONFLICT DO NOTHING` seed. It is sent as one multi-statement simple query, which Postgres runs as a single implicit transaction — a failed migration leaves nothing half-applied. Keep it one `pool.query` call.
+
 There's no separate migration tool. Edit `SCHEMA` in `db.js` only with statements that are safe to run on an already-migrated DB.
+
+### Dependencies
+
+`package-lock.json` is committed and the Dockerfile runs `npm ci --omit=dev`, so a rebuild installs exactly the locked tree and fails loudly if the lock and `package.json` disagree. The base image is still the `node:22-bookworm-slim` tag (not a digest). The host has no node; to change a dependency, edit `package.json` and regenerate the lock in a scratch copy:
+
+```
+docker run --rm --user $(id -u):$(id -g) -e HOME=/tmp -v "$PWD":/w -w /w \
+  node:22-bookworm-slim npm install --package-lock-only --ignore-scripts
+```
+
+then commit both files and `docker compose up -d --build`.
 
 ### Logs
 
@@ -299,7 +378,7 @@ docker logs yaab-api          # one-shot
 docker logs -f yaab-api       # tail
 ```
 
-Fastify writes structured JSON to stdout at `info` (override with `LOG_LEVEL` env).
+Fastify writes structured JSON (pino) to stdout at `info` (override with `LOG_LEVEL` env) — two lines per request, `incoming request` and `request completed`. 5xx errors are logged at `error` with the stack by the app error handler; an idle Postgres connection dropped under the pool (a postgres restart, `pg_terminate_backend`) logs `idle pg client error` at `warn` and the process carries on — before the listener existed, that event crashed the API. The pending-signup notice logs `pending-signup notice sent` with a count.
 
 ### Inspect data
 
@@ -318,6 +397,8 @@ curl https://yaab.thewheeliebois.com/api/healthz
 # → {"ok":true}
 ```
 
+It does not touch the database, so it answers `ok` while Postgres is unreachable — it proves the process is up, nothing more.
+
 ## Secrets
 
 `.env` lives at the **project root**, not inside `api/`:
@@ -331,9 +412,13 @@ Standard keys:
 | Key | Notes |
 |---|---|
 | `DATABASE_URL` | `postgres://yaab_user:<pw>@postgres:5432/yaab_db` |
-| `SESSION_SECRET` | Used by `@fastify/cookie` for signed cookies. 32+ random bytes. |
+| `SESSION_SECRET` | Passed to `@fastify/cookie` but **inert**: no cookie is set with `signed: true` (see "Auth + sessions"). Keep it set; rotating it does nothing. |
 | `NODE_ENV` | `production` in deploys. |
 | `PORT` | `3000`. Listen host is hardcoded `0.0.0.0`. |
+| `MAILER_URL` | Shared mailer endpoint (`http://mailer:3000/send`). Unset → operator mails are silently skipped (`mail.js`). |
+| `MAILER_TOKEN` | Bearer token for the mailer. Same skip rule. |
+| `BUG_ATTACH_DIR` | Attachment directory inside the container; default `/data/bug-attachments` (the compose bind mount). The disk floor is measured here. |
+| `LOG_LEVEL` | Pino level, default `info`. |
 
 Standard caveats: `chmod 600 .env`, never echo to chat output, never commit. `.dockerignore` excludes `.env*` from the build context.
 
@@ -342,7 +427,7 @@ Standard caveats: `chmod 600 .env`, never echo to chat output, never commit. `.d
 - **Cookie name `yaab_sid`.** The frontend's `js/app/auth.js` (and the sync layer) assume this exact name. Renaming requires a coordinated frontend change and silent-logs-everyone-out at deploy.
 - **Response shapes** — the frontend's `js/app/sync.js` reads these literal keys:
   - `PUT /armies/:id` → `{ id, updated_at, applied }`. `applied` is what runOp reads to know whether its write landed; on older builds without it the client falls back to comparing `updated_at` against the ts it sent.
-  - `PUT /state` → `{ updated_at }`.
+  - `PUT /state` → `{ updated_at, applied }` (same meaning as on armies).
   - `GET /armies` → array of `{ id, name, updated_at }` (summary, no `payload`).
   - `GET /armies/:id` → full `{ id, name, payload, updated_at }`.
   - `GET /state` → `{ payload, updated_at }` or literal `null` when no row exists.
@@ -360,5 +445,8 @@ Standard caveats: `chmod 600 .env`, never echo to chat output, never commit. `.d
 - **`Number(row.user_id)` cast in `armies.js`.** `pg`'s default BIGINT-as-string means `row.user_id === u.user_id` is always false. The cross-user 403 check requires the explicit cast. Same applies anywhere else you read a BIGINT column and compare it to `req.user.user_id`.
 - **`ID_RE` in `armies.js`.** Don't tighten it back to UUID-only — the client emits short ids. If you tighten it at all, coordinate with the client id generator first.
 - **Idempotent migrations.** `migrate()` runs on every boot. Any new DDL added to `SCHEMA` must be safe to re-run (use `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `DO $$ … IF NOT EXISTS … $$` blocks for ALTERs).
-- **Rate-limit config object shape.** `authLimit = { config: { rateLimit: { max, timeWindow } } }` is the route-level override format `@fastify/rate-limit` expects. If you bump the plugin major version, re-check the override key path.
+- **Rate-limit config object shape.** `authLimit = { config: { rateLimit: { max, timeWindow } } }` is the route-level override format `@fastify/rate-limit` expects; `perUserLimit()` adds `hook: 'preHandler'` and `keyGenerator`. Don't drop that `hook` — at the default `onRequest` stage `req.user` is not loaded yet and every per-user limit silently becomes per-IP. If you bump the plugin major version, re-check the override key path and the per-route `hook` option.
+- **The app error handler.** 5xx must keep answering `{ error: "internal" }` (no driver messages to clients). Set it before registering route plugins, or child contexts keep Fastify's default.
+- **`pool.on('error')` in `server.js`.** Without it an idle-client error from pg-pool is an uncaught EventEmitter error and kills the process.
+- **The login timing equaliser, the LWW upserts, the single-query `migrate()`, the advisory-lock image cap, and the attachment handling** (server-generated names, `attachmentPath` regex gate, MIME allowlist without SVG, `wx`/`0640` streaming, unlink on every failure path) were all reviewed on 2026-10-30 and are correct as they stand.
 - **`/api` prefix is stripped by Caddy.** Don't register routes as `/api/auth/login` — they'd 404 because the proxy already removed the prefix.

@@ -1,5 +1,5 @@
 import { createWriteStream } from 'node:fs';
-import { mkdir, unlink } from 'node:fs/promises';
+import { mkdir, statfs, unlink } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
@@ -8,7 +8,7 @@ import path from 'node:path';
 // stored on disk (BUG_ATTACH_DIR, a bind mount) and served back to admins
 // only — see GET /admin/bugs/:id/attachment in admin.js.
 export const ATTACH_DIR = process.env.BUG_ATTACH_DIR || '/data/bug-attachments';
-export const ATTACH_MAX = 50 * 1024 * 1024;   // matches the client's 50 MB cap
+export const ATTACH_MAX = 50 * 1024 * 1024;   // matches the client's 50 MB cap; server.js's multipart fileSize
 
 // Raster images and video only. SVG is deliberately excluded: it is an image
 // MIME that can carry script, and these files are served from the site's own
@@ -50,6 +50,15 @@ export async function saveAttachment(part) {
     throw Object.assign(new Error('attachment too large'), { statusCode: 413 });
   }
   return { file, mime, size };
+}
+
+// Bytes available to an unprivileged writer on the attachment volume. It is a
+// bind mount on the host's root filesystem, which Postgres, Caddy's logs and
+// every other site share, so POST /bugs refuses attachments below a floor.
+export async function attachDirFreeBytes() {
+  await mkdir(ATTACH_DIR, { recursive: true });
+  const s = await statfs(ATTACH_DIR);
+  return Number(s.bavail) * Number(s.bsize);
 }
 
 export function attachmentPath(file) {

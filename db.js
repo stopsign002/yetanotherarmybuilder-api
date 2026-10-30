@@ -179,6 +179,20 @@ ALTER TABLE bug_reports
 -- Work queue for the hourly fixer: open and not yet escalated to a human.
 CREATE INDEX IF NOT EXISTS bug_reports_actionable
   ON bug_reports (created_at) WHERE fixed = FALSE AND escalated_at IS NULL;
+
+-- Coalescing state for operator notifications (signup-notify.js). One row per
+-- kind; 'signup' batches "new pending account" mails to at most one an hour.
+-- Seeded with notified_through = now() on the boot that creates it, so
+-- accounts already mailed individually before batching existed are not mailed
+-- again; sent_at = '-infinity' lets the next registration mail at once.
+CREATE TABLE IF NOT EXISTS notify_state (
+  kind              TEXT        PRIMARY KEY,
+  sent_at           TIMESTAMPTZ NOT NULL,
+  notified_through  TIMESTAMPTZ NOT NULL
+);
+INSERT INTO notify_state (kind, sent_at, notified_through)
+     VALUES ('signup', '-infinity', now())
+ON CONFLICT (kind) DO NOTHING;
 `;
 
 export async function migrate() {

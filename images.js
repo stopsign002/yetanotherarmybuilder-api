@@ -1,4 +1,5 @@
 import { pool, query } from './db.js';
+import { perUserLimit } from './limits.js';
 
 // Per-user library cap and per-image size cap. The library cap matches the
 // client's hard-coded ImageStore.LIMIT in cards-mode.js. The size cap is
@@ -12,6 +13,12 @@ const DATA_URL_MAX = 7_000_000;
 // (≈ 6.7 MB base64) plus the JSON envelope, without raising the global
 // 2 MB Fastify body limit that the small /armies and /state PUTs rely on.
 const POST_BODY_LIMIT = 10_000_000;
+
+// Uploads per user per hour. Generous for building a library, but each one can
+// be a 7 MB row that rides every nightly pg_dumpall into the year-locked B2
+// bucket, so it is not unlimited. Keyed on the user (limits.js); because the
+// limit runs at preHandler, the JSON body is parsed before it is checked.
+const POSTS_PER_HOUR = 30;
 
 // data: URL allowlist. Anchored prefix; everything after the comma is the
 // base64 payload itself, which we don't validate beyond length.
@@ -48,7 +55,10 @@ export async function imagesRoutes(app) {
     return rows.map(rowToRecord);
   });
 
-  app.post('/images', { bodyLimit: POST_BODY_LIMIT }, async (req, reply) => {
+  app.post('/images', {
+    bodyLimit: POST_BODY_LIMIT,
+    ...perUserLimit(POSTS_PER_HOUR, '1 hour', 'Too many image uploads.'),
+  }, async (req, reply) => {
     const u = requireUser(req, reply);
     if (!u) return;
 
@@ -104,7 +114,9 @@ export async function imagesRoutes(app) {
     if (!u) return;
 
     const idStr = req.params.id;
-    if (!/^[0-9]{1,20}$/.test(idStr)) {
+    // 18 digits is always below the BIGINT maximum, so a longer id is a 404
+    // here rather than a Postgres "out of range" 500.
+    if (!/^[0-9]{1,18}$/.test(idStr)) {
       return reply.code(404).send({ error: 'not found' });
     }
     const id = BigInt(idStr);

@@ -14,6 +14,8 @@ import { stateRoutes } from './state.js';
 import { imagesRoutes } from './images.js';
 import { adminRoutes } from './admin.js';
 import { bugsRoutes } from './bugs.js';
+import { ATTACH_MAX } from './attachments.js';
+import { notifyPendingSignups } from './signup-notify.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
@@ -22,6 +24,29 @@ const app = Fastify({
   logger: { level: process.env.LOG_LEVEL || 'info' },
   trustProxy: true,
   bodyLimit: 2_000_000,
+});
+
+// pg-pool emits 'error' when Postgres drops an IDLE client (a postgres restart,
+// pg_terminate_backend). With no listener that EventEmitter 'error' throws and
+// takes the whole process down. The pool has already discarded the client, so
+// logging is all there is to do; the next query opens a fresh connection.
+pool.on('error', (err) => app.log.warn({ err }, 'idle pg client error'));
+
+// Every 5xx answers a fixed body and is logged with its stack here; nothing
+// from a thrown error (a Postgres message, a SQLSTATE, a constraint name)
+// reaches the client. 4xx errors with a `publicBody` (limits.js) send that
+// body; other 4xx (bad JSON, body too large, rate limit on the auth routes)
+// go on to Fastify's default handler and keep their usual shape. Set before
+// the route plugins are registered so every child context inherits it.
+app.setErrorHandler((err, req, reply) => {
+  const sc = Number(err.statusCode);
+  const status = sc >= 400 && sc < 600 ? sc : 500;
+  if (status >= 500) {
+    req.log.error({ err }, 'request failed');
+    return reply.code(status).send({ error: 'internal' });
+  }
+  if (err.publicBody) return reply.code(status).send(err.publicBody);
+  return reply.send(err);
 });
 
 await app.register(cookie, { secret: process.env.SESSION_SECRET });
@@ -33,8 +58,12 @@ await app.register(rateLimit, {
 
 // Only POST /bugs takes multipart (an optional screenshot / recording). One
 // file, 50 MB, a handful of short text fields; everything else stays JSON.
+// fieldSize is in BYTES: 64 KiB holds the 16,000-char diagnostics cap even
+// when every char is 4 bytes of UTF-8, so bugs.js's own char-based truncation
+// is what applies on both the JSON and the multipart path. (It was 20,000,
+// which silently cut multibyte diagnostics short on the multipart path only.)
 await app.register(multipart, {
-  limits: { fileSize: 50 * 1024 * 1024, files: 1, fields: 10, fieldSize: 20_000, parts: 12 },
+  limits: { fileSize: ATTACH_MAX, files: 1, fields: 10, fieldSize: 64 * 1024, parts: 12 },
 });
 
 app.decorateRequest('user', null);
@@ -102,5 +131,15 @@ async function runPrune() {
 }
 await runPrune();
 setInterval(runPrune, 24 * 60 * 60 * 1000).unref();
+
+// Pending-signup notices are batched to one mail an hour (signup-notify.js).
+// Register sends the first one at once; this sweep sends the batched ones
+// once the hour is up. Cheap when there is nothing new: one small query.
+async function runSignupSweep() {
+  try { await notifyPendingSignups(app.log); }
+  catch (err) { app.log.warn({ err }, 'pending-signup sweep failed'); }
+}
+await runSignupSweep();
+setInterval(runSignupSweep, 5 * 60 * 1000).unref();
 
 await app.listen({ host: HOST, port: PORT });
