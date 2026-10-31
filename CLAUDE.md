@@ -14,7 +14,10 @@ Fastify backend for yaab. Provides username/password auth, per-user army sync, a
 | `auth.js` | All `/auth/*` routes. argon2id hashing, recovery-code generation, per-route 5/min rate limit on register/login/recover (per IP) and change-password (per user), the 25-pending registration cap. |
 | `limits.js` | `perUserLimit(max, window, message?)` route options (per-user key, IP fallback, `hook: 'preHandler'`), `userOrIpKey`, `publicError(status, error)`. |
 | `signup-notify.js` | `notifyPendingSignups()` / `kickSignupNotice()`: the operator's "new pending account" mail, coalesced to at most one an hour through the `notify_state` table. |
-| `armies.js` | All `/armies/*` routes. Client-id regex `ID_RE`, LWW upsert via `INSERT … ON CONFLICT … CASE`. |
+| `http.js` | `reject(reply, status, error)`, `requireUser(req, reply, error?)` (401; default body `unauthorized`, armies/state/auth pass `NOT_SIGNED_IN` = `Not signed in.`) and `requireAdmin` (401/403). Used by every route module. |
+| `validate.js` | `ID_RE`, `USERNAME_RE`, `isNumericId` (≤18 digits), `parseTs`, `clampedTs(param)` (the `LEAST(…, now())` fragment), `asNumber` (pg BIGINT → number). |
+| `lww.js` | `lwwUpsertSql({ table, insert, conflict, lww, owner? })`: the one last-write-wins upsert template behind `PUT /armies/:id` and `PUT /state` (output verified byte-identical to the former hand-written statements). |
+| `armies.js` | All `/armies/*` routes. LWW upsert built by `lww.js`. |
 | `state.js` | `GET /state` and `PUT /state`. Single KV bag per user, same LWW pattern as armies. |
 | `images.js` | All `/images*` routes — per-user card-back image library for Cards mode. Route-level `bodyLimit: 10_000_000`; advisory-lock-protected count→insert for the 30-image cap. |
 | `admin.js` | All `/admin/*` routes — site-operator panel: approve/revoke users, list+delete any user's image, manage bug reports, lightweight pending-approval counter. Every handler runs through `requireAdmin()` (401 unauth, 403 non-admin). |

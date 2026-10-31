@@ -2,24 +2,11 @@ import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { attachmentPath, extForMime, removeAttachment } from './attachments.js';
 import { query } from './db.js';
+import { reject, requireAdmin } from './http.js';
 import { deleteAllUserSessions } from './sessions.js';
+import { USERNAME_RE, asNumber, isNumericId } from './validate.js';
 
-const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
 const FIX_NOTE_MAX = 4000;
-// Numeric ids below are capped at 18 digits: always within BIGINT, so an
-// oversized id is a 404 instead of a Postgres "out of range" 500.
-
-function requireAdmin(req, reply) {
-  if (!req.user) {
-    reply.code(401).send({ error: 'unauthorized' });
-    return null;
-  }
-  if (!req.user.is_admin) {
-    reply.code(403).send({ error: 'forbidden' });
-    return null;
-  }
-  return req.user;
-}
 
 function tsToMs(t) {
   if (!t) return null;
@@ -30,12 +17,12 @@ function tsToMs(t) {
 
 function bugRowToRecord(r) {
   return {
-    id:          Number(r.id),
+    id:          asNumber(r.id),
     username:    r.username,
     kind:        r.kind || 'bug',
-    attachment_url:  r.attachment_file ? `/api/admin/bugs/${Number(r.id)}/attachment` : null,
+    attachment_url:  r.attachment_file ? `/api/admin/bugs/${asNumber(r.id)}/attachment` : null,
     attachment_mime: r.attachment_mime || null,
-    attachment_size: r.attachment_size != null ? Number(r.attachment_size) : null,
+    attachment_size: r.attachment_size != null ? asNumber(r.attachment_size) : null,
     title:       r.title,
     description: r.description,
     diagnostics: r.diagnostics,
@@ -76,7 +63,7 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const target = req.params.username;
-    if (!USERNAME_RE.test(target)) return reply.code(404).send({ error: 'not found' });
+    if (!USERNAME_RE.test(target)) return reject(reply, 404, 'not found');
 
     const { rowCount } = await query(
       `UPDATE users
@@ -88,7 +75,7 @@ export async function adminRoutes(app) {
         WHERE username = $2`,
       [u.username, target]
     );
-    if (rowCount === 0) return reply.code(404).send({ error: 'not found' });
+    if (rowCount === 0) return reject(reply, 404, 'not found');
     return { ok: true };
   });
 
@@ -96,16 +83,16 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const target = req.params.username;
-    if (!USERNAME_RE.test(target)) return reply.code(404).send({ error: 'not found' });
+    if (!USERNAME_RE.test(target)) return reject(reply, 404, 'not found');
 
     const { rows } = await query(
       'SELECT id, is_admin FROM users WHERE username = $1',
       [target]
     );
     const targetUser = rows[0];
-    if (!targetUser) return reply.code(404).send({ error: 'not found' });
+    if (!targetUser) return reject(reply, 404, 'not found');
     // Refuse admin-on-admin via the API. Demote in the DB if needed.
-    if (targetUser.is_admin) return reply.code(403).send({ error: 'cannot revoke admin' });
+    if (targetUser.is_admin) return reject(reply, 403, 'cannot revoke admin');
 
     await query(
       'UPDATE users SET revoked = TRUE, revoked_at = now() WHERE id = $1',
@@ -126,7 +113,7 @@ export async function adminRoutes(app) {
         ORDER BY i.added_at DESC, i.id DESC`
     );
     return rows.map(r => ({
-      id:      Number(r.id),
+      id:      asNumber(r.id),
       owner:   r.owner,
       name:    r.name,
       dataUrl: r.data_url,
@@ -138,14 +125,12 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const idStr = req.params.id;
-    if (!/^[0-9]{1,18}$/.test(idStr)) {
-      return reply.code(404).send({ error: 'not found' });
-    }
+    if (!isNumericId(idStr)) return reject(reply, 404, 'not found');
     const { rowCount } = await query(
       'DELETE FROM card_back_images WHERE id = $1',
       [idStr]
     );
-    if (rowCount === 0) return reply.code(404).send({ error: 'not found' });
+    if (rowCount === 0) return reject(reply, 404, 'not found');
     return reply.code(204).send();
   });
 
@@ -181,9 +166,7 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const idStr = req.params.id;
-    if (!/^[0-9]{1,18}$/.test(idStr)) {
-      return reply.code(404).send({ error: 'not found' });
-    }
+    if (!isNumericId(idStr)) return reject(reply, 404, 'not found');
 
     const body = req.body || {};
     let note = null;
@@ -191,7 +174,7 @@ export async function adminRoutes(app) {
       const t = body.note.trim();
       if (t) {
         if (t.length > FIX_NOTE_MAX) {
-          return reply.code(400).send({ error: 'note too long' });
+          return reject(reply, 400, 'note too long');
         }
         note = t;
       }
@@ -209,7 +192,7 @@ export async function adminRoutes(app) {
               kind, attachment_file, attachment_mime, attachment_size`,
       [u.username, note, idStr]
     );
-    if (rows.length === 0) return reply.code(404).send({ error: 'not found' });
+    if (rows.length === 0) return reject(reply, 404, 'not found');
     return bugRowToRecord(rows[0]);
   });
 
@@ -217,9 +200,7 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const idStr = req.params.id;
-    if (!/^[0-9]{1,18}$/.test(idStr)) {
-      return reply.code(404).send({ error: 'not found' });
-    }
+    if (!isNumericId(idStr)) return reject(reply, 404, 'not found');
     const { rows } = await query(
       `UPDATE bug_reports
           SET fixed      = FALSE,
@@ -232,7 +213,7 @@ export async function adminRoutes(app) {
               kind, attachment_file, attachment_mime, attachment_size`,
       [idStr]
     );
-    if (rows.length === 0) return reply.code(404).send({ error: 'not found' });
+    if (rows.length === 0) return reject(reply, 404, 'not found');
     return bugRowToRecord(rows[0]);
   });
 
@@ -240,14 +221,12 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const idStr = req.params.id;
-    if (!/^[0-9]{1,18}$/.test(idStr)) {
-      return reply.code(404).send({ error: 'not found' });
-    }
+    if (!isNumericId(idStr)) return reject(reply, 404, 'not found');
     const { rows } = await query(
       'DELETE FROM bug_reports WHERE id = $1 RETURNING attachment_file',
       [idStr]
     );
-    if (rows.length === 0) return reply.code(404).send({ error: 'not found' });
+    if (rows.length === 0) return reject(reply, 404, 'not found');
     if (rows[0].attachment_file) await removeAttachment(rows[0].attachment_file);
     return reply.code(204).send();
   });
@@ -259,13 +238,13 @@ export async function adminRoutes(app) {
     const u = requireAdmin(req, reply);
     if (!u) return;
     const idStr = req.params.id;
-    if (!/^[0-9]{1,18}$/.test(idStr)) return reply.code(404).send({ error: 'not found' });
+    if (!isNumericId(idStr)) return reject(reply, 404, 'not found');
     const { rows } = await query(
       'SELECT attachment_file, attachment_mime FROM bug_reports WHERE id = $1', [idStr]);
     const p = rows[0] && attachmentPath(rows[0].attachment_file);
-    if (!p || !extForMime(rows[0].attachment_mime)) return reply.code(404).send({ error: 'not found' });
+    if (!p || !extForMime(rows[0].attachment_mime)) return reject(reply, 404, 'not found');
     let st;
-    try { st = await stat(p); } catch (_) { return reply.code(404).send({ error: 'not found' }); }
+    try { st = await stat(p); } catch (_) { return reject(reply, 404, 'not found'); }
     return reply
       .header('Content-Type', rows[0].attachment_mime)
       .header('Content-Length', st.size)

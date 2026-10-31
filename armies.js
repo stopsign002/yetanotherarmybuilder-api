@@ -1,30 +1,23 @@
 import { query } from './db.js';
+import { NOT_SIGNED_IN, reject, requireUser } from './http.js';
+import { lwwUpsertSql } from './lww.js';
+import { ID_RE, asNumber, parseTs } from './validate.js';
 
-// Client-generated army ids: short base36-ish strings, but accept anything
-// URL-safe up to 128 chars to keep this future-proof if the client switches
-// to UUIDs or longer ids later.
-const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const NAME_MAX = 200;
 const PAYLOAD_MAX = 1_000_000;
 
-function requireUser(req, reply) {
-  if (!req.user) {
-    reply.code(401).send({ error: 'Not signed in.' });
-    return null;
-  }
-  return req.user;
-}
-
-function parseTs(value) {
-  if (typeof value !== 'string') return null;
-  const t = Date.parse(value);
-  if (!Number.isFinite(t)) return null;
-  return new Date(t);
-}
+// Built once; see lww.js for the clamp / `applied` / ownership rules.
+const UPSERT = lwwUpsertSql({
+  table: 'armies',
+  insert: ['id', 'user_id', 'name', 'payload'],
+  conflict: 'id',
+  lww: ['name', 'payload'],
+  owner: 'user_id',
+});
 
 export async function armiesRoutes(app) {
   app.get('/armies', async (req, reply) => {
-    const u = requireUser(req, reply);
+    const u = requireUser(req, reply, NOT_SIGNED_IN);
     if (!u) return;
     const { rows } = await query(
       `SELECT id, name, updated_at
@@ -41,10 +34,10 @@ export async function armiesRoutes(app) {
   });
 
   app.get('/armies/:id', async (req, reply) => {
-    const u = requireUser(req, reply);
+    const u = requireUser(req, reply, NOT_SIGNED_IN);
     if (!u) return;
     const id = req.params.id;
-    if (!ID_RE.test(id)) return reply.code(400).send({ error: 'Bad army id.' });
+    if (!ID_RE.test(id)) return reject(reply, 400, 'Bad army id.');
 
     const { rows } = await query(
       `SELECT id, name, payload, updated_at
@@ -52,7 +45,7 @@ export async function armiesRoutes(app) {
         WHERE user_id = $1 AND id = $2`,
       [u.user_id, id]
     );
-    if (!rows[0]) return reply.code(404).send({ error: 'Not found.' });
+    if (!rows[0]) return reject(reply, 404, 'Not found.');
     const r = rows[0];
     return {
       id: r.id,
@@ -63,58 +56,33 @@ export async function armiesRoutes(app) {
   });
 
   app.put('/armies/:id', async (req, reply) => {
-    const u = requireUser(req, reply);
+    const u = requireUser(req, reply, NOT_SIGNED_IN);
     if (!u) return;
     const id = req.params.id;
-    if (!ID_RE.test(id)) return reply.code(400).send({ error: 'Bad army id.' });
+    if (!ID_RE.test(id)) return reject(reply, 400, 'Bad army id.');
 
     const { name, payload, updated_at } = req.body || {};
     if (typeof name !== 'string' || name.length > NAME_MAX) {
-      return reply.code(400).send({ error: 'Bad name.' });
+      return reject(reply, 400, 'Bad name.');
     }
     if (typeof payload !== 'string' || payload.length > PAYLOAD_MAX) {
-      return reply.code(400).send({ error: 'Bad payload.' });
+      return reject(reply, 400, 'Bad payload.');
     }
     const ts = parseTs(updated_at) || new Date();
 
-    // Last-write-wins on updated_at: if incoming timestamp is older than what
-    // we have, keep the existing row but echo the stored timestamp so the
-    // client can reconcile.
-    //
-    // The client's clock is clamped to the server's (LEAST(ts, now())) before
-    // it is compared or stored. Without that, one device with a fast clock
-    // writes a future-dated row and every correctly-set device then loses
-    // the >= race until wall-clock time catches up — a silent lockout with
-    // no error anywhere (yetanotherarmybuilder-api#1). A client may be early
-    // but never in the future.
-    //
-    // `applied` says whether THIS write landed. The upsert always "updates"
-    // the row (often to its own values), so rowCount is 1 either way and the
-    // echoed updated_at alone can't distinguish "your write won" from "your
-    // clock was clamped" — both differ from what was sent.
-    const { rows } = await query(
-      `INSERT INTO armies (id, user_id, name, payload, updated_at)
-            VALUES ($1, $2, $3, $4, LEAST($5::timestamptz, now()))
-       ON CONFLICT (id) DO UPDATE
-              SET name       = CASE WHEN armies.user_id = EXCLUDED.user_id AND EXCLUDED.updated_at >= armies.updated_at THEN EXCLUDED.name       ELSE armies.name       END,
-                  payload    = CASE WHEN armies.user_id = EXCLUDED.user_id AND EXCLUDED.updated_at >= armies.updated_at THEN EXCLUDED.payload    ELSE armies.payload    END,
-                  updated_at = CASE WHEN armies.user_id = EXCLUDED.user_id AND EXCLUDED.updated_at >= armies.updated_at THEN EXCLUDED.updated_at ELSE armies.updated_at END
-        RETURNING user_id, updated_at,
-                  (updated_at = LEAST($5::timestamptz, now())) AS applied`,
-      [id, u.user_id, name, payload, ts]
-    );
+    const { rows } = await query(UPSERT, [id, u.user_id, name, payload, ts]);
     const row = rows[0];
-    if (Number(row.user_id) !== u.user_id) {
-      return reply.code(403).send({ error: 'Army belongs to another user.' });
+    if (asNumber(row.user_id) !== u.user_id) {
+      return reject(reply, 403, 'Army belongs to another user.');
     }
     return { id, updated_at: row.updated_at.toISOString(), applied: row.applied === true };
   });
 
   app.delete('/armies/:id', async (req, reply) => {
-    const u = requireUser(req, reply);
+    const u = requireUser(req, reply, NOT_SIGNED_IN);
     if (!u) return;
     const id = req.params.id;
-    if (!ID_RE.test(id)) return reply.code(400).send({ error: 'Bad army id.' });
+    if (!ID_RE.test(id)) return reject(reply, 400, 'Bad army id.');
 
     await query('DELETE FROM armies WHERE id = $1 AND user_id = $2', [id, u.user_id]);
     return reply.code(204).send();

@@ -2,7 +2,9 @@ import argon2 from 'argon2';
 import { randomBytes } from 'node:crypto';
 import { query } from './db.js';
 import { kickSignupNotice } from './signup-notify.js';
+import { NOT_SIGNED_IN, reject, requireUser } from './http.js';
 import { perUserLimit } from './limits.js';
+import { USERNAME_RE } from './validate.js';
 import {
   COOKIE_NAME,
   cookieOpts,
@@ -12,7 +14,6 @@ import {
   deleteAllUserSessions,
 } from './sessions.js';
 
-const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
 const MIN_PW = 8;
 const MAX_PW = 256;
 const RECOVERY_BYTES = 18;
@@ -23,10 +24,6 @@ const PENDING_MAX = 25;
 
 function generateRecoveryCode() {
   return randomBytes(RECOVERY_BYTES).toString('base64url');
-}
-
-function badInput(reply, error, status = 400) {
-  return reply.code(status).send({ error });
 }
 
 export async function authRoutes(app) {
@@ -42,15 +39,15 @@ export async function authRoutes(app) {
   app.post('/auth/register', authLimit, async (req, reply) => {
     const { username, password } = req.body || {};
     if (typeof username !== 'string' || !USERNAME_RE.test(username)) {
-      return badInput(reply, 'Username must be 3–32 characters; letters, digits, _, ., - only.');
+      return reject(reply, 400, 'Username must be 3–32 characters; letters, digits, _, ., - only.');
     }
     if (typeof password !== 'string' || password.length < MIN_PW || password.length > MAX_PW) {
-      return badInput(reply, `Password must be ${MIN_PW}–${MAX_PW} characters.`);
+      return reject(reply, 400, `Password must be ${MIN_PW}–${MAX_PW} characters.`);
     }
 
     const existing = await query('SELECT 1 FROM users WHERE username = $1', [username]);
     if (existing.rowCount) {
-      return badInput(reply, 'Username is already taken.', 409);
+      return reject(reply, 409, 'Username is already taken.');
     }
 
     // Before the argon2 work, so a refused request costs one COUNT.
@@ -58,7 +55,7 @@ export async function authRoutes(app) {
       'SELECT COUNT(*)::int AS c FROM users WHERE approved = FALSE AND revoked = FALSE'
     );
     if (pending.rows[0].c >= PENDING_MAX) {
-      return badInput(reply, 'Sign-ups are paused while existing requests are reviewed. Try again later.', 503);
+      return reject(reply, 503, 'Sign-ups are paused while existing requests are reviewed. Try again later.');
     }
 
     const recoveryCode = generateRecoveryCode();
@@ -78,7 +75,7 @@ export async function authRoutes(app) {
     } catch (err) {
       // Two concurrent registrations of one name both pass the SELECT above;
       // the loser hits the UNIQUE constraint. Same answer as the pre-check.
-      if (err.code === '23505') return badInput(reply, 'Username is already taken.', 409);
+      if (err.code === '23505') return reject(reply, 409, 'Username is already taken.');
       throw err;
     }
     const user = rows[0];
@@ -95,13 +92,13 @@ export async function authRoutes(app) {
   app.post('/auth/login', authLimit, async (req, reply) => {
     const { username, password } = req.body || {};
     if (typeof username !== 'string' || typeof password !== 'string') {
-      return badInput(reply, 'Username and password required.');
+      return reject(reply, 400, 'Username and password required.');
     }
     // Validate the format before it reaches Postgres: a NUL byte used to come
     // back as a raw 500 with the SQLSTATE. The rules are public (register
     // states them), so a 400 here says nothing about which accounts exist.
     if (!USERNAME_RE.test(username)) {
-      return badInput(reply, 'Invalid username or password.');
+      return reject(reply, 400, 'Invalid username or password.');
     }
 
     const { rows } = await query(
@@ -122,13 +119,13 @@ export async function authRoutes(app) {
       ok = false;
     }
     if (!user || !ok) {
-      return badInput(reply, 'Invalid username or password.', 401);
+      return reject(reply, 401, 'Invalid username or password.');
     }
     // Approval gating: distinct error codes once credentials are known
     // valid, so the client can render the right message. (Pre-check we
     // can't distinguish — that would leak which usernames exist.)
-    if (user.revoked)  return reply.code(403).send({ error: 'revoked' });
-    if (!user.approved) return reply.code(403).send({ error: 'pending_approval' });
+    if (user.revoked)  return reject(reply, 403, 'revoked');
+    if (!user.approved) return reject(reply, 403, 'pending_approval');
 
     const { sid } = await createSession(user.id);
     reply.setCookie(COOKIE_NAME, sid, cookieOpts());
@@ -143,20 +140,21 @@ export async function authRoutes(app) {
   });
 
   app.get('/auth/me', async (req, reply) => {
-    if (!req.user) return reply.code(401).send({ error: 'Not signed in.' });
-    return { username: req.user.username, is_admin: !!req.user.is_admin };
+    const u = requireUser(req, reply, NOT_SIGNED_IN);
+    if (!u) return;
+    return { username: u.username, is_admin: !!u.is_admin };
   });
 
   app.post('/auth/recover', authLimit, async (req, reply) => {
     const { username, recoveryCode, newPassword } = req.body || {};
     if (typeof username !== 'string' || typeof recoveryCode !== 'string' || typeof newPassword !== 'string') {
-      return badInput(reply, 'username, recoveryCode, and newPassword required.');
+      return reject(reply, 400, 'username, recoveryCode, and newPassword required.');
     }
     if (!USERNAME_RE.test(username)) {
-      return badInput(reply, 'Invalid username or recovery code.');
+      return reject(reply, 400, 'Invalid username or recovery code.');
     }
     if (newPassword.length < MIN_PW || newPassword.length > MAX_PW) {
-      return badInput(reply, `Password must be ${MIN_PW}–${MAX_PW} characters.`);
+      return reject(reply, 400, `Password must be ${MIN_PW}–${MAX_PW} characters.`);
     }
 
     const { rows } = await query(
@@ -174,12 +172,12 @@ export async function authRoutes(app) {
       ok = false;
     }
     if (!user || !ok) {
-      return badInput(reply, 'Invalid username or recovery code.', 401);
+      return reject(reply, 401, 'Invalid username or recovery code.');
     }
     // Same approval gating as login: a recovery code rotation that
     // didn't actually unlock access would be confusing.
-    if (user.revoked)  return reply.code(403).send({ error: 'revoked' });
-    if (!user.approved) return reply.code(403).send({ error: 'pending_approval' });
+    if (user.revoked)  return reject(reply, 403, 'revoked');
+    if (!user.approved) return reject(reply, 403, 'pending_approval');
 
     const newRecoveryCode = generateRecoveryCode();
     const [pwHash, recHash] = await Promise.all([
@@ -203,30 +201,31 @@ export async function authRoutes(app) {
   // and a flood of argon2 verifies must not stall the 4-thread libuv pool that
   // every other login shares.
   app.post('/auth/change-password', perUserLimit(5, '1 minute'), async (req, reply) => {
-    if (!req.user) return reply.code(401).send({ error: 'Not signed in.' });
+    const u = requireUser(req, reply, NOT_SIGNED_IN);
+    if (!u) return;
     const { oldPassword, newPassword } = req.body || {};
     if (typeof oldPassword !== 'string' || typeof newPassword !== 'string') {
-      return badInput(reply, 'oldPassword and newPassword required.');
+      return reject(reply, 400, 'oldPassword and newPassword required.');
     }
     if (newPassword.length < MIN_PW || newPassword.length > MAX_PW) {
-      return badInput(reply, `Password must be ${MIN_PW}–${MAX_PW} characters.`);
+      return reject(reply, 400, `Password must be ${MIN_PW}–${MAX_PW} characters.`);
     }
 
-    const { rows } = await query('SELECT password FROM users WHERE id = $1', [req.user.user_id]);
+    const { rows } = await query('SELECT password FROM users WHERE id = $1', [u.user_id]);
     const stored = rows[0]?.password;
     let ok = false;
     try { ok = stored ? await argon2.verify(stored, oldPassword) : false; }
     catch (_) { ok = false; }
-    if (!ok) return badInput(reply, 'Old password is incorrect.', 401);
+    if (!ok) return reject(reply, 401, 'Old password is incorrect.');
 
     const pwHash = await argon2.hash(newPassword, { type: argon2.argon2id });
-    await query('UPDATE users SET password = $1 WHERE id = $2', [pwHash, req.user.user_id]);
+    await query('UPDATE users SET password = $1 WHERE id = $2', [pwHash, u.user_id]);
 
     // Rotate sessions: invalidate all except the current one.
     const currentSid = req.cookies?.[COOKIE_NAME];
     await query(
       'DELETE FROM sessions WHERE user_id = $1 AND session_id <> $2',
-      [req.user.user_id, currentSid]
+      [u.user_id, currentSid]
     );
     return { ok: true };
   });

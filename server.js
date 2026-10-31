@@ -16,6 +16,7 @@ import { adminRoutes } from './admin.js';
 import { bugsRoutes } from './bugs.js';
 import { ATTACH_MAX } from './attachments.js';
 import { notifyPendingSignups } from './signup-notify.js';
+import { asNumber } from './validate.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = '0.0.0.0';
@@ -77,7 +78,7 @@ app.addHook('preHandler', async (req, reply) => {
   // action also wipes session rows, so this is belt-and-braces.
   if (session && !session.revoked) {
     req.user = {
-      user_id: Number(session.user_id),
+      user_id: asNumber(session.user_id),
       username: session.username,
       is_admin: !!session.is_admin,
       session_id: session.session_id,

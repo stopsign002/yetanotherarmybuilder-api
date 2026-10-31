@@ -1,6 +1,8 @@
 import { pool } from './db.js';
 import { saveAttachment, removeAttachment, attachDirFreeBytes } from './attachments.js';
+import { reject, requireUser } from './http.js';
 import { perUserLimit } from './limits.js';
+import { asNumber } from './validate.js';
 
 // Field caps from the docs/ADMIN_API.md spec.
 const TITLE_MAX = 200;
@@ -45,19 +47,11 @@ async function usage(db, username) {
       WHERE username = $1`,
     [username]
   );
-  return { open: rows[0].open, bytes: Number(rows[0].bytes) };
+  return { open: rows[0].open, bytes: asNumber(rows[0].bytes) };
 }
 
 const OPEN_MSG = `You already have ${OPEN_MAX} open reports. Please wait for some to be resolved before sending more.`;
 const QUOTA_MSG = 'Your attachment storage is full (200 MB across your reports). Send this one without an attachment.';
-
-function requireUser(req, reply) {
-  if (!req.user) {
-    reply.code(401).send({ error: 'unauthorized' });
-    return null;
-  }
-  return req.user;
-}
 
 export async function bugsRoutes(app) {
   // Any signed-in user can submit. Admin browsing/management endpoints
@@ -71,15 +65,15 @@ export async function bugsRoutes(app) {
     // checked again under a lock at insert time (below), so concurrent
     // requests cannot slip past them.
     const pre = await usage(pool, u.username);
-    if (pre.open >= OPEN_MAX) return reply.code(429).send({ error: OPEN_MSG });
+    if (pre.open >= OPEN_MAX) return reject(reply, 429, OPEN_MSG);
     if (isMultipart) {
-      if (pre.bytes >= ATTACH_BYTES_MAX) return reply.code(413).send({ error: QUOTA_MSG });
+      if (pre.bytes >= ATTACH_BYTES_MAX) return reject(reply, 413, QUOTA_MSG);
       let free = Infinity;
       try { free = await attachDirFreeBytes(); }
       catch (err) { req.log.warn({ err }, 'statfs on attachment dir failed; not enforcing the disk floor'); }
       if (free < DISK_FLOOR) {
         req.log.warn({ free }, 'attachment refused: free disk below floor');
-        return reply.code(507).send({ error: 'The server is low on disk space, so attachments are paused. Send the report without one.' });
+        return reject(reply, 507, 'The server is low on disk space, so attachments are paused. Send the report without one.');
       }
     }
 
@@ -104,13 +98,13 @@ export async function bugsRoutes(app) {
         if (att) await removeAttachment(att.file);
         const code = err.statusCode === 415 || err.statusCode === 413 ? err.statusCode
           : (err.code === 'FST_REQ_FILE_TOO_LARGE' ? 413 : 400);
-        return reply.code(code).send({ error: code === 415 ? 'attachment must be an image or video'
-          : code === 413 ? 'attachment too large (max 50 MB)' : 'bad upload' });
+        return reject(reply, code, code === 415 ? 'attachment must be an image or video'
+          : code === 413 ? 'attachment too large (max 50 MB)' : 'bad upload');
       }
     }
-    const reject = async (code, error) => {
+    const refuse = async (code, error) => {
       if (att) await removeAttachment(att.file);
-      return reply.code(code).send({ error });
+      return reject(reply, code, error);
     };
 
     const kind = body.kind === 'feature' ? 'feature' : 'bug';
@@ -119,14 +113,14 @@ export async function bugsRoutes(app) {
     const diagnostics = typeof body.diagnostics === 'string' ? clampDiagnostics(body.diagnostics) : null;
     const email = typeof body.email === 'string' ? body.email.trim() : '';
 
-    if (!title) return reject(400, 'title required');
-    if (title.length > TITLE_MAX) return reject(400, 'title too long');
-    if (!description) return reject(400, 'description required');
-    if (description.length > DESCRIPTION_MAX) return reject(400, 'description too long');
+    if (!title) return refuse(400, 'title required');
+    if (title.length > TITLE_MAX) return refuse(400, 'title too long');
+    if (!description) return refuse(400, 'description required');
+    if (description.length > DESCRIPTION_MAX) return refuse(400, 'description too long');
     // Optional. Reject a malformed one rather than storing it — a silently
     // dropped address means the reporter waits for a note that never comes.
     if (email && (email.length > EMAIL_MAX || !EMAIL_RE.test(email))) {
-      return reject(400, 'email looks invalid');
+      return refuse(400, 'email looks invalid');
     }
 
     // Re-check the per-user limits and insert in one transaction, serialised
@@ -140,11 +134,11 @@ export async function bugsRoutes(app) {
       const now = await usage(client, u.username);
       if (now.open >= OPEN_MAX) {
         await client.query('ROLLBACK');
-        return reject(429, OPEN_MSG);
+        return refuse(429, OPEN_MSG);
       }
       if (att && now.bytes + att.size > ATTACH_BYTES_MAX) {
         await client.query('ROLLBACK');
-        return reject(413, QUOTA_MSG);
+        return refuse(413, QUOTA_MSG);
       }
       ({ rows } = await client.query(
         `INSERT INTO bug_reports (username, kind, title, description, diagnostics, email,
@@ -165,6 +159,6 @@ export async function bugsRoutes(app) {
     // No submission email on purpose. bug-fixer.sh picks this up within the
     // hour and mails either "fixed" or "needs you" — a heads-up now would
     // just be noise arriving minutes before the useful message.
-    return { id: Number(rows[0].id) };
+    return { id: asNumber(rows[0].id) };
   });
 }

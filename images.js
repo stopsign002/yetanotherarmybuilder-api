@@ -1,5 +1,7 @@
 import { pool, query } from './db.js';
+import { reject, requireUser } from './http.js';
 import { perUserLimit } from './limits.js';
+import { asNumber, isNumericId } from './validate.js';
 
 // Per-user library cap and per-image size cap. The library cap matches the
 // client's hard-coded ImageStore.LIMIT in cards-mode.js. The size cap is
@@ -24,17 +26,9 @@ const POSTS_PER_HOUR = 30;
 // base64 payload itself, which we don't validate beyond length.
 const DATA_URL_RE = /^data:image\/(png|jpe?g|webp|gif|svg\+xml);base64,/;
 
-function requireUser(req, reply) {
-  if (!req.user) {
-    reply.code(401).send({ error: 'unauthorized' });
-    return null;
-  }
-  return req.user;
-}
-
 function rowToRecord(row) {
   return {
-    id: Number(row.id),
+    id: asNumber(row.id),
     name: row.name,
     dataUrl: row.data_url,
     addedAt: row.added_at instanceof Date ? row.added_at.getTime() : Date.parse(row.added_at),
@@ -66,13 +60,11 @@ export async function imagesRoutes(app) {
     const rawName = typeof body.name === 'string' ? body.name.trim() : '';
     const dataUrl = typeof body.dataUrl === 'string' ? body.dataUrl : '';
 
-    if (!rawName) return reply.code(400).send({ error: 'name required' });
-    if (rawName.length > NAME_MAX) return reply.code(400).send({ error: 'name too long' });
-    if (!dataUrl) return reply.code(400).send({ error: 'dataUrl required' });
-    if (!DATA_URL_RE.test(dataUrl)) return reply.code(400).send({ error: 'unsupported image type' });
-    if (dataUrl.length > DATA_URL_MAX) {
-      return reply.code(413).send({ error: 'image too large' });
-    }
+    if (!rawName) return reject(reply, 400, 'name required');
+    if (rawName.length > NAME_MAX) return reject(reply, 400, 'name too long');
+    if (!dataUrl) return reject(reply, 400, 'dataUrl required');
+    if (!DATA_URL_RE.test(dataUrl)) return reject(reply, 400, 'unsupported image type');
+    if (dataUrl.length > DATA_URL_MAX) return reject(reply, 413, 'image too large');
 
     // Single transaction: advisory-lock on the user_id, count, then insert.
     // The lock makes the count→insert pair race-free vs other concurrent
@@ -114,20 +106,13 @@ export async function imagesRoutes(app) {
     if (!u) return;
 
     const idStr = req.params.id;
-    // 18 digits is always below the BIGINT maximum, so a longer id is a 404
-    // here rather than a Postgres "out of range" 500.
-    if (!/^[0-9]{1,18}$/.test(idStr)) {
-      return reply.code(404).send({ error: 'not found' });
-    }
-    const id = BigInt(idStr);
+    if (!isNumericId(idStr)) return reject(reply, 404, 'not found');
 
     const result = await query(
       'DELETE FROM card_back_images WHERE id = $1 AND user_id = $2',
-      [id.toString(), u.user_id]
+      [idStr, u.user_id]
     );
-    if (result.rowCount === 0) {
-      return reply.code(404).send({ error: 'not found' });
-    }
+    if (result.rowCount === 0) return reject(reply, 404, 'not found');
     return reply.code(204).send();
   });
 }

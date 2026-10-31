@@ -7,7 +7,7 @@ import path from 'node:path';
 // Bug-report attachments: one screenshot or screen recording per report,
 // stored on disk (BUG_ATTACH_DIR, a bind mount) and served back to admins
 // only — see GET /admin/bugs/:id/attachment in admin.js.
-export const ATTACH_DIR = process.env.BUG_ATTACH_DIR || '/data/bug-attachments';
+const ATTACH_DIR = process.env.BUG_ATTACH_DIR || '/data/bug-attachments';
 export const ATTACH_MAX = 50 * 1024 * 1024;   // matches the client's 50 MB cap; server.js's multipart fileSize
 
 // Raster images and video only. SVG is deliberately excluded: it is an image
