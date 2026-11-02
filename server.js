@@ -14,6 +14,7 @@ import { stateRoutes } from './state.js';
 import { imagesRoutes } from './images.js';
 import { adminRoutes } from './admin.js';
 import { bugsRoutes } from './bugs.js';
+import { exportRoutes } from './export.js';
 import { ATTACH_MAX } from './attachments.js';
 import { notifyPendingSignups } from './signup-notify.js';
 import { asNumber } from './validate.js';
@@ -107,6 +108,7 @@ await app.register(stateRoutes);
 await app.register(imagesRoutes);
 await app.register(adminRoutes);
 await app.register(bugsRoutes);
+await app.register(exportRoutes);
 
 const close = async (signal) => {
   app.log.info({ signal }, 'shutting down');
