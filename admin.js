@@ -138,6 +138,19 @@ export async function adminRoutes(app) {
   // has a fallback that counts /admin/users itself, so this is just an
   // optimisation — but the banner polls every 60 s, so a cheap query
   // matters more here than for one-shot reads.
+  // Same idea for bug reports: the banner (js/app/pending-approval-banner.js)
+  // also tells the operator when reports are waiting (owner, 2026-11-03).
+  // Open = not fixed; escalated ones count too, they are exactly the ones a
+  // human has to look at.
+  app.get('/admin/bugs/open-count', async (req, reply) => {
+    const u = requireAdmin(req, reply);
+    if (!u) return;
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS c FROM bug_reports WHERE fixed = FALSE`
+    );
+    return { count: rows[0].c };
+  });
+
   app.get('/admin/users/pending-count', async (req, reply) => {
     const u = requireAdmin(req, reply);
     if (!u) return;
